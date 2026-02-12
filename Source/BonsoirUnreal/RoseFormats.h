@@ -561,6 +561,7 @@ struct FRoseIFO {
   TArray<FRoseMapObject> Objects;
   TArray<FRoseMapObject>
       Buildings; // Using same struct as they share properties
+  TArray<FRoseMapObject> Animations; // Type 6
 
   bool Load(const FString &FilePath) {
     TArray<uint8> Data;
@@ -599,7 +600,8 @@ struct FRoseIFO {
         ZoneName = Ar.ReadRoseString();
 
       } else if (Block.Type == EMapBlock::Object ||
-                 Block.Type == EMapBlock::Building) {
+                 Block.Type == EMapBlock::Building ||
+                 Block.Type == EMapBlock::Animation) {
         // Skip Block Specific Header (WaterPlane has WaterSize, others just
         // Count) Objects don't have extra header, just count.
         int32 Count;
@@ -613,6 +615,8 @@ struct FRoseIFO {
             Objects.Add(Obj);
           else if (Block.Type == EMapBlock::Building)
             Buildings.Add(Obj);
+          else if (Block.Type == EMapBlock::Animation)
+            Animations.Add(Obj);
         }
       }
     }
@@ -656,6 +660,7 @@ struct FRoseZSC {
     int16 CollisionMode = 0;
     int16 BoneIndex = 0;
     int16 DummyIndex = 0;
+    FString AnimPath; // ConstantAnimation (ZSC property 30)
   };
 
   struct FObjectEntry {
@@ -825,9 +830,14 @@ struct FRoseZSC {
           case 29: // Collision
             Ar << Part.CollisionMode;
             break;
-          case 30: // ConstantAnimation (string, use btLen to skip)
-            Ar.Seek(Ar.Tell() + btLen);
-            break;
+          case 30: // ConstantAnimation (string path to ZMO)
+          {
+            TArray<uint8> Buf;
+            Buf.SetNum(btLen);
+            Ar.Serialize(Buf.GetData(), btLen);
+            Buf.Add(0); // null-terminate
+            Part.AnimPath = FString(ANSI_TO_TCHAR((ANSICHAR *)Buf.GetData()));
+          } break;
           case 31: // VisibleRangeSet
           case 32: // UseLightmap
             Ar.Seek(Ar.Tell() + btLen);
@@ -1118,20 +1128,24 @@ struct FRoseZMD {
 
 /**
  * ROSE Animation (ZMO)
+ * Channel types use bitfield values matching the ROSE engine:
+ *   Position = 1<<1 = 2
+ *   Rotation = 1<<2 = 4
+ *   Scale    = 1<<10 = 1024
  */
 struct FRoseAnimChannel {
-  int32 Type; // 0=Pos, 1=Rot, 2=Scale
+  int32 Type; // Bitfield: 2=Position, 4=Rotation, 1024=Scale
   int32 BoneID;
   TArray<FVector> PosKeys;
   TArray<FQuat> RotKeys;
-  TArray<float> ScaleKeys;
+  TArray<FVector> ScaleKeys;
 };
 
 struct FRoseZMO {
   FString FormatString;
-  int32 FPS;
-  int32 FrameCount;
-  int32 ChannelCount;
+  int32 FPS = 0;
+  int32 FrameCount = 0;
+  int32 ChannelCount = 0;
   TArray<FRoseAnimChannel> Channels;
 
   bool Load(const FString &FilePath) {
@@ -1147,24 +1161,31 @@ struct FRoseZMO {
     Channels.SetNum(ChannelCount);
     for (int i = 0; i < ChannelCount; ++i) {
       Ar << Channels[i].Type << Channels[i].BoneID;
+    }
 
-      if (Channels[i].Type == 0) { // Position
-        Channels[i].PosKeys.SetNum(FrameCount);
-        for (int f = 0; f < FrameCount; ++f) {
-          Ar << Channels[i].PosKeys[f].X << Channels[i].PosKeys[f].Y
-             << Channels[i].PosKeys[f].Z;
-        }
-      } else if (Channels[i].Type == 1) { // Rotation
-        Channels[i].RotKeys.SetNum(FrameCount);
-        for (int f = 0; f < FrameCount; ++f) {
-          float w, x, y, z;
-          Ar << w << x << y << z;
-          Channels[i].RotKeys[f] = FQuat(x, y, z, w);
-        }
-      } else if (Channels[i].Type == 2) { // Scale
-        Channels[i].ScaleKeys.SetNum(FrameCount);
-        for (int f = 0; f < FrameCount; ++f) {
-          Ar << Channels[i].ScaleKeys[f];
+    // Read frame data (frames are interleaved across channels)
+    for (int f = 0; f < FrameCount; ++f) {
+      for (int i = 0; i < ChannelCount; ++i) {
+        if (Channels[i].Type == 2) { // Position
+          FVector Pos;
+          Ar << Pos.X << Pos.Y << Pos.Z;
+          // Apply rtuPosition: (X, -Y, Z)
+          Pos.Y = -Pos.Y;
+          Channels[i].PosKeys.Add(Pos);
+        } else if (Channels[i].Type == 4) { // Rotation
+          float W, X, Y, Z;
+          Ar << W << X << Y << Z;
+          // Apply rtuRotation: (-X, Y, -Z, W)
+          Channels[i].RotKeys.Add(FQuat(-X, Y, -Z, W));
+        } else if (Channels[i].Type == 1024) { // Scale
+          FVector S;
+          Ar << S.X << S.Y << S.Z;
+          Channels[i].ScaleKeys.Add(S);
+        } else {
+          // Unknown channel type - skip based on common sizes
+          // Most unknown types are single floats or vectors
+          UE_LOG(LogRoseImporter, Warning, TEXT("ZMO: Unknown channel type %d"),
+                 Channels[i].Type);
         }
       }
     }

@@ -1440,6 +1440,7 @@ void URoseImporter::ProcessObjects(const FRoseIFO &IFO, UWorld *World,
     }
 
     int32 SpawnCount = 0;
+    int32 AnimCount = 0;
     for (const FRoseMapObject &MapObj : MapObjects) {
       if (MapObj.ObjectID < 0 || MapObj.ObjectID >= ZSC.Objects.Num()) {
         continue;
@@ -1468,19 +1469,6 @@ void URoseImporter::ProcessObjects(const FRoseIFO &IFO, UWorld *World,
           continue;
         }
 
-        UHierarchicalInstancedStaticMeshComponent *HISM = nullptr;
-        if (GlobalHISMMap.Contains(Mesh)) {
-          HISM = GlobalHISMMap[Mesh];
-        } else {
-          FString HISMName =
-              TEXT("HISM_") + Mesh->GetName() + TEXT("_") + DebugCtx;
-          HISM = NewObject<UHierarchicalInstancedStaticMeshComponent>(
-              ZoneObjectsActor, *HISMName);
-          HISM->SetStaticMesh(Mesh);
-          HISM->SetMobility(EComponentMobility::Static);
-          GlobalHISMMap.Add(Mesh, HISM);
-        }
-
         // Skip meshes with invalid bounds
         if (Mesh->GetBoundingBox().GetExtent().ContainsNaN()) {
           continue;
@@ -1503,13 +1491,41 @@ void URoseImporter::ProcessObjects(const FRoseIFO &IFO, UWorld *World,
           continue;
         }
 
-        HISM->AddInstance(FinalTransform);
+        // Animated parts get individual actors; static parts use HISM
+        if (!Part.AnimPath.IsEmpty()) {
+          SpawnAnimatedObject(Mesh, FinalTransform, Part.AnimPath, World);
+          AnimCount++;
+        } else {
+          UHierarchicalInstancedStaticMeshComponent *HISM = nullptr;
+          if (GlobalHISMMap.Contains(Mesh)) {
+            HISM = GlobalHISMMap[Mesh];
+          } else {
+            FString HISMName =
+                TEXT("HISM_") + Mesh->GetName() + TEXT("_") + DebugCtx;
+            HISM = NewObject<UHierarchicalInstancedStaticMeshComponent>(
+                ZoneObjectsActor, *HISMName);
+            HISM->SetStaticMesh(Mesh);
+            HISM->SetMobility(EComponentMobility::Static);
+
+            // [Collision Fix] Disable collision for "grass"
+            if (Mesh->GetName().Contains(TEXT("grass"),
+                                         ESearchCase::IgnoreCase) ||
+                MeshPath.Contains(TEXT("grass"), ESearchCase::IgnoreCase)) {
+              HISM->SetCollisionEnabled(ECollisionEnabled::NoCollision);
+              HISM->SetCollisionProfileName(
+                  UCollisionProfile::NoCollision_ProfileName);
+            }
+
+            GlobalHISMMap.Add(Mesh, HISM);
+          }
+          HISM->AddInstance(FinalTransform);
+        }
         SpawnCount++;
       }
     }
     UE_LOG(LogRoseImporter, Log,
-           TEXT("[%s] Spawned %d instances from %d entries"), *DebugCtx,
-           SpawnCount, MapObjects.Num());
+           TEXT("[%s] Spawned %d instances (%d animated) from %d entries"),
+           *DebugCtx, SpawnCount, AnimCount, MapObjects.Num());
   };
 
   // Process Decorations
@@ -1517,8 +1533,122 @@ void URoseImporter::ProcessObjects(const FRoseIFO &IFO, UWorld *World,
 
   // Process Buildings
   ProcessList(IFO.Buildings, CnstZSC, TEXT("Cnst"));
+
+  // Process Animations (Flags, etc.)
+  // Use the dynamically discovered AnimZSC (or fallback to DecoZSC if empty)
+  if (AnimZSC.Meshes.Num() > 0 || AnimZSC.Objects.Num() > 0) {
+    ProcessList(IFO.Animations, AnimZSC, TEXT("AnimObj"));
+  } else {
+    UE_LOG(LogRoseImporter, Warning,
+           TEXT("No AnimZSC found, trying DecoZSC for Animations (might be "
+                "wrong objects)"));
+    // Only fallback if really desperate, but user reported
+    // trees-instead-of-flags, so fallback is bad. But better than nothing? No,
+    // trees are worse. Let's NOT fallback to DecoZSC to avoid "Tree Flags".
+    // ProcessList(IFO.Animations, DecoZSC, TEXT("AnimObj"));
+  }
 }
 
+void URoseImporter::SpawnAnimatedObject(UStaticMesh *Mesh,
+                                        const FTransform &Transform,
+                                        const FString &AnimPath,
+                                        UWorld *World) {
+  if (!World || !Mesh)
+    return;
+
+  // Load the ZMO animation
+  // AnimPath from ZSC already contains the relative path (e.g. "3Ddata/...")
+  FString FullAnimPath = FPaths::Combine(RoseRootPath, AnimPath);
+  FullAnimPath.ReplaceInline(TEXT("\\"), TEXT("/"));
+
+  FRoseZMO ZMO;
+  if (!ZMO.Load(FullAnimPath)) {
+    UE_LOG(LogRoseImporter, Warning,
+           TEXT("[Anim] Failed to load ZMO: %s - spawning static"),
+           *FullAnimPath);
+    // Fall back to static placement
+    if (ZoneObjectsActor) {
+      UHierarchicalInstancedStaticMeshComponent *HISM = nullptr;
+      if (GlobalHISMMap.Contains(Mesh)) {
+        HISM = GlobalHISMMap[Mesh];
+      } else {
+        FString HISMName = TEXT("HISM_") + Mesh->GetName() + TEXT("_Fallback");
+        HISM = NewObject<UHierarchicalInstancedStaticMeshComponent>(
+            ZoneObjectsActor, *HISMName);
+        HISM->SetStaticMesh(Mesh);
+        HISM->SetMobility(EComponentMobility::Static);
+        GlobalHISMMap.Add(Mesh, HISM);
+      }
+      HISM->AddInstance(Transform);
+    }
+    return;
+  }
+
+  if (ZMO.FrameCount <= 0 || ZMO.FPS <= 0) {
+    UE_LOG(LogRoseImporter, Warning,
+           TEXT("[Anim] ZMO has no frames or invalid FPS: %s"), *AnimPath);
+    return;
+  }
+
+  // Spawn a StaticMeshActor
+  FActorSpawnParameters SpawnParams;
+  SpawnParams.SpawnCollisionHandlingOverride =
+      ESpawnActorCollisionHandlingMethod::AlwaysSpawn;
+
+  AActor *Actor =
+      World->SpawnActor<AActor>(AActor::StaticClass(), Transform, SpawnParams);
+  if (!Actor)
+    return;
+
+  Actor->SetActorLabel(
+      FString::Printf(TEXT("Anim_%s"), *FPaths::GetBaseFilename(AnimPath)));
+
+  // Add root scene component
+  USceneComponent *Root = NewObject<USceneComponent>(Actor, TEXT("Root"));
+  Actor->SetRootComponent(Root);
+  Root->RegisterComponent();
+  Root->SetWorldTransform(Transform);
+
+  // Add mesh component (animation drives its relative transform)
+  UStaticMeshComponent *MeshComp =
+      NewObject<UStaticMeshComponent>(Actor, TEXT("AnimMesh"));
+  MeshComp->SetStaticMesh(Mesh);
+  MeshComp->SetMobility(EComponentMobility::Movable);
+  MeshComp->AttachToComponent(Root,
+                              FAttachmentTransformRules::KeepRelativeTransform);
+  MeshComp->RegisterComponent();
+
+  // Create animation component (tick-based, applies ZMO keyframes)
+  URoseAnimComponent *AnimComp =
+      NewObject<URoseAnimComponent>(Actor, TEXT("AnimDriver"));
+  AnimComp->FPS = ZMO.FPS;
+  AnimComp->FrameCount = ZMO.FrameCount;
+  AnimComp->Duration = (float)ZMO.FrameCount / (float)ZMO.FPS;
+  AnimComp->TargetComponent = MeshComp;
+
+  // Copy channel data into the component
+  for (const FRoseAnimChannel &Chan : ZMO.Channels) {
+    // FIX: Only apply animation for the Root Bone (0).
+    // Child bones/dummies should not drive the entire mesh transform.
+    if (Chan.BoneID != 0)
+      continue;
+
+    if (Chan.Type == 2 && Chan.PosKeys.Num() > 0) {
+      AnimComp->PosKeys = Chan.PosKeys;
+    } else if (Chan.Type == 4 && Chan.RotKeys.Num() > 0) {
+      AnimComp->RotKeys = Chan.RotKeys;
+    } else if (Chan.Type == 1024 && Chan.ScaleKeys.Num() > 0) {
+      AnimComp->ScaleKeys = Chan.ScaleKeys;
+    }
+  }
+
+  AnimComp->RegisterComponent();
+
+  UE_LOG(LogRoseImporter, Log,
+         TEXT("[Anim] Spawned: %s (%d frames @ %d FPS, Pos:%d Rot:%d Scl:%d)"),
+         *AnimPath, ZMO.FrameCount, ZMO.FPS, AnimComp->PosKeys.Num(),
+         AnimComp->RotKeys.Num(), AnimComp->ScaleKeys.Num());
+}
 void URoseImporter::EnsureMasterMaterial() {
   auto EnsureVariant = [&](UMaterial *&MatPtr, const FString &Name,
                            EBlendMode BlendMode) {
@@ -1601,13 +1731,19 @@ void URoseImporter::EnsureMasterMaterial() {
 }
 
 UTexture2D *URoseImporter::LoadRoseTexture(const FString &RP) {
+  // Fast in-memory cache check
+  if (UTexture2D **Cached = TextureCache.Find(RP)) {
+    return *Cached;
+  }
+
   FString AB = FPaths::GetBaseFilename(RP);
   FString PN = TEXT("/Game/Rose/Imported/Textures/") + AB;
 
-  // Check if texture already loaded
+  // Check if texture already loaded in UE
   UTexture2D *Existing =
       FindObject<UTexture2D>(nullptr, *(PN + TEXT(".") + AB));
   if (Existing) {
+    TextureCache.Add(RP, Existing);
     return Existing;
   }
 
@@ -1714,6 +1850,7 @@ UTexture2D *URoseImporter::LoadRoseTexture(const FString &RP) {
             UE_LOG(LogRoseImporter, Log,
                    TEXT("[Texture] Successfully imported via factory: %s"),
                    *AB);
+            TextureCache.Add(RP, ImportedTexture);
             return ImportedTexture;
           }
         }
@@ -1935,8 +2072,7 @@ UStaticMesh *URoseImporter::ImportRoseMesh(const FString &MP,
     return nullptr;
   }
 
-  UStaticMesh *Mesh = NewObject<UStaticMesh>(
-      GetTransientPackage(), *ObjectTools::SanitizeObjectName(BN), RF_Public);
+  // Build MeshDescription from ZMS data
   FMeshDescription MD;
   FStaticMeshAttributes(MD).Register();
   FPolygonGroupID PG = MD.CreatePolygonGroup();
@@ -1948,7 +2084,8 @@ UStaticMesh *URoseImporter::ImportRoseMesh(const FString &MP,
   TArray<FVertexInstanceID> VInsts;
   auto VPos = FStaticMeshAttributes(MD).GetVertexPositions();
   auto VNorms = FStaticMeshAttributes(MD).GetVertexInstanceNormals();
-  // Detect active UV channels and Variance
+
+  // Detect active UV channels and variance
   bool bHasUV1 = false, bHasUV2 = false, bHasUV3 = false, bHasUV4 = false;
   FVector2f MinUV1(FLT_MAX, FLT_MAX), MaxUV1(-FLT_MAX, -FLT_MAX);
   FVector2f MinUV2(FLT_MAX, FLT_MAX), MaxUV2(-FLT_MAX, -FLT_MAX);
@@ -1962,12 +2099,10 @@ UStaticMesh *URoseImporter::ImportRoseMesh(const FString &MP,
       bHasUV3 = true;
     if (!V.UV4.IsZero())
       bHasUV4 = true;
-
     MinUV1.X = FMath::Min(MinUV1.X, V.UV1.X);
     MinUV1.Y = FMath::Min(MinUV1.Y, V.UV1.Y);
     MaxUV1.X = FMath::Max(MaxUV1.X, V.UV1.X);
     MaxUV1.Y = FMath::Max(MaxUV1.Y, V.UV1.Y);
-
     MinUV2.X = FMath::Min(MinUV2.X, V.UV2.X);
     MinUV2.Y = FMath::Min(MinUV2.Y, V.UV2.Y);
     MaxUV2.X = FMath::Max(MaxUV2.X, V.UV2.X);
@@ -1981,9 +2116,8 @@ UStaticMesh *URoseImporter::ImportRoseMesh(const FString &MP,
   if (ExtentUV1 < 0.001f && ExtentUV2 > 0.01f) {
     SrcCh0 = 2;
     UE_LOG(LogRoseImporter, Warning,
-           TEXT("[SmartUV] Swapping UV2 to Channel 0 for mesh '%s' (UV1 "
-                "Extent=%f, UV2 Extent=%f)"),
-           *BN, ExtentUV1, ExtentUV2);
+           TEXT("[SmartUV] Swapping UV2→Ch0 for '%s' (UV1=%f, UV2=%f)"), *BN,
+           ExtentUV1, ExtentUV2);
   }
 
   int32 NumUVs = 1;
@@ -2000,17 +2134,13 @@ UStaticMesh *URoseImporter::ImportRoseMesh(const FString &MP,
   for (int i = 0; i < ZMS.Vertices.Num(); ++i) {
     FVertexInstanceID ID = MD.CreateVertexInstance(VIDs[i]);
     VInsts.Add(ID);
-    // Apply rtuPosition (Y-flip) + 100x scale, matching reference Zms.h:
-    // vertexPositions[i] = rtuPosition(read<FVector>()) * 100;
     VPos[VIDs[i]] = FVector3f(ZMS.Vertices[i].Position.X * 100.0f,
                               -ZMS.Vertices[i].Position.Y * 100.0f,
                               ZMS.Vertices[i].Position.Z * 100.0f);
-    // Apply rtuPosition Y-flip to normals too (must match vertex position flip)
     FVector3f N = ZMS.Vertices[i].Normal;
     N.Y = -N.Y;
     VNorms[ID] = N;
 
-    // Set UVs based on Smart Decision
     if (SrcCh0 == 2) {
       VUVs.Set(ID, 0, ZMS.Vertices[i].UV2);
       if (NumUVs >= 2)
@@ -2020,52 +2150,45 @@ UStaticMesh *URoseImporter::ImportRoseMesh(const FString &MP,
       if (bHasUV2 && NumUVs >= 2)
         VUVs.Set(ID, 1, ZMS.Vertices[i].UV2);
     }
-
     if (bHasUV3 && NumUVs >= 3)
       VUVs.Set(ID, 2, ZMS.Vertices[i].UV3);
     if (bHasUV4 && NumUVs >= 4)
       VUVs.Set(ID, 3, ZMS.Vertices[i].UV4);
   }
+
   for (int i = 0; i < ZMS.Indices.Num(); i += 3) {
-    // With rtuPosition Y-flip on vertices, use original winding order
-    // (matching reference plugin which also uses rtuPosition + original order)
     TArray<FVertexInstanceID> T;
     T.Add(VInsts[ZMS.Indices[i]]);
     T.Add(VInsts[ZMS.Indices[i + 1]]);
     T.Add(VInsts[ZMS.Indices[i + 2]]);
     MD.CreateTriangle(PG, T);
   }
-  Mesh->GetStaticMaterials().Add(
+
+  // Create mesh directly in its final package (no FBX round-trip)
+  UPackage *MeshPkg = CreatePackage(*PN);
+  MeshPkg->FullyLoad();
+
+  UStaticMesh *FinalMesh =
+      NewObject<UStaticMesh>(MeshPkg, *AssetName, RF_Public | RF_Standalone);
+  FinalMesh->GetStaticMaterials().Add(
       FStaticMaterial(nullptr, FName("RoseMaterial")));
-  FStaticMeshSourceModel &SM = Mesh->AddSourceModel();
-  SM.BuildSettings.bRecomputeNormals = SM.BuildSettings.bRecomputeTangents =
-      false;
+  FStaticMeshSourceModel &SM = FinalMesh->AddSourceModel();
+  SM.BuildSettings.bRecomputeNormals = false;
+  SM.BuildSettings.bRecomputeTangents = true;
+  SM.BuildSettings.bRemoveDegenerates = true;
   TArray<const FMeshDescription *> MDPs;
   MDPs.Add(&MD);
-  Mesh->BuildFromMeshDescriptions(MDPs);
+  FinalMesh->BuildFromMeshDescriptions(MDPs);
 
-  // Export to FBX and Import via Factory
-  FString TempFBXPath = FPaths::CreateTempFilename(
-      *FPaths::ProjectSavedDir(), TEXT("RoseMesh_"), TEXT(".fbx"));
+  // Setup collision
+  FinalMesh->CreateBodySetup();
+  FinalMesh->GetBodySetup()->CollisionTraceFlag =
+      ECollisionTraceFlag::CTF_UseComplexAsSimple;
 
-  UStaticMesh *FinalMesh = nullptr;
+  UpdateMeshMaterial(FinalMesh, M);
+  SaveRoseAsset(FinalMesh);
 
-  if (ExportMeshToFBX(Mesh, TempFBXPath)) {
-    UE_LOG(LogRoseImporter, Log, TEXT("[ImportMesh] Exported temp FBX: %s"),
-           *TempFBXPath);
-    // Fix: Pass full AssetName (BN_MS) to Import logic
-    FinalMesh = ImportFBXMesh(TempFBXPath, AssetName);
-    IFileManager::Get().Delete(*TempFBXPath);
-  } else {
-    UE_LOG(LogRoseImporter, Error, TEXT("[ImportMesh] Failed to export FBX"));
-  }
-
-  if (FinalMesh) {
-    UpdateMeshMaterial(FinalMesh, M);
-    return FinalMesh;
-  }
-
-  return nullptr;
+  return FinalMesh;
 }
 
 void URoseImporter::UpdateMeshMaterial(UStaticMesh *Mesh,
@@ -2518,7 +2641,58 @@ bool URoseImporter::LoadZSCsFromListZone(const FString &RoseDataPath,
     }
   }
 
-  return bSuccess;
+  // Dynamic Scan for AnimZSC (likely Col 11 or 14)
+  FString AnimZSCFile;
+
+  // First pass: Look for specific "Special" or "Event" ZSCs as suggested by
+  // user
+  for (int32 col = 0; col < ListZoneSTB.GetColumnCount(); ++col) {
+    if (col == 12 || col == 13)
+      continue;
+    FString CellVal = CleanPath(ListZoneSTB.GetCell(FoundRow, col));
+
+    if (CellVal.Contains(TEXT("EVENT_OBJECT"), ESearchCase::IgnoreCase) ||
+        CellVal.Contains(TEXT("DECO_SPECIAL"), ESearchCase::IgnoreCase)) {
+      UE_LOG(LogRoseImporter, Log, TEXT("Found PRIORITY AnimZSC at Col %d: %s"),
+             col, *CellVal);
+      AnimZSCFile = CellVal;
+      break;
+    }
+  }
+
+  // Second pass: If not found, take ANY extra ZSC
+  if (AnimZSCFile.IsEmpty()) {
+    for (int32 col = 0; col < ListZoneSTB.GetColumnCount(); ++col) {
+      if (col == 12 || col == 13)
+        continue;
+      FString CellVal = CleanPath(ListZoneSTB.GetCell(FoundRow, col));
+      if (CellVal.EndsWith(TEXT(".ZSC"), ESearchCase::IgnoreCase) ||
+          CellVal.EndsWith(TEXT(".zsc"), ESearchCase::IgnoreCase)) {
+        UE_LOG(LogRoseImporter, Log,
+               TEXT("Found generic AnimZSC at Col %d: %s"), col, *CellVal);
+        AnimZSCFile = CellVal;
+        break;
+      }
+    }
+  }
+
+  if (!AnimZSCFile.IsEmpty()) {
+    FString AnimZSCPath =
+        FPaths::Combine(RoseDataPath, TEXT("3Ddata"), AnimZSCFile);
+    if (AnimZSC.Load(AnimZSCPath)) {
+      UE_LOG(LogRoseImporter, Log,
+             TEXT("Loaded Animation ZSC: %d meshes, %d materials"),
+             AnimZSC.Meshes.Num(), AnimZSC.Materials.Num());
+    } else {
+      UE_LOG(LogRoseImporter, Warning, TEXT("Failed to load Anim ZSC: %s"),
+             *AnimZSCPath);
+      // Don't fail the whole import for this, just warn
+    }
+  } else {
+    UE_LOG(LogRoseImporter, Log, TEXT("No extra ZSC found for Animations."));
+  }
+}
+return bSuccess;
 }
 
 bool URoseImporter::SaveRoseAsset(UObject *Asset) {

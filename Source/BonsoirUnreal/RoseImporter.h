@@ -5,6 +5,86 @@
 #include "RoseFormats.h"
 #include "RoseImporter.generated.h"
 
+/**
+ * Animation component that drives mesh transforms from ZMO data.
+ * Stores keyframe channels and applies interpolated transforms each tick.
+ */
+UCLASS()
+class URoseAnimComponent : public UActorComponent {
+  GENERATED_BODY()
+
+public:
+  // ZMO animation data
+  int32 FPS = 30;
+  int32 FrameCount = 0;
+  float Duration = 0.0f;
+  float ElapsedTime = 0.0f;
+
+  // Channel data
+  TArray<FVector> PosKeys;
+  TArray<FQuat> RotKeys;
+  TArray<FVector> ScaleKeys;
+
+  // Target component to animate
+  UPROPERTY()
+  USceneComponent *TargetComponent = nullptr;
+
+  // Base transform (the initial placement transform)
+  FVector BaseLocation = FVector::ZeroVector;
+  FRotator BaseRotation = FRotator::ZeroRotator;
+  FVector BaseScale = FVector::OneVector;
+
+  URoseAnimComponent() {
+    PrimaryComponentTick.bCanEverTick = true;
+    PrimaryComponentTick.bStartWithTickEnabled = true;
+    bTickInEditor = true; // Run in editor viewport
+  }
+
+  virtual void
+  TickComponent(float DeltaTime, ELevelTick TickType,
+                FActorComponentTickFunction *ThisTickFunction) override {
+    Super::TickComponent(DeltaTime, TickType, ThisTickFunction);
+
+    if (!TargetComponent || Duration <= 0.0f)
+      return;
+
+    // Advance time and loop
+    ElapsedTime += DeltaTime;
+    if (ElapsedTime >= Duration)
+      ElapsedTime = FMath::Fmod(ElapsedTime, Duration);
+
+    // Calculate frame index and interpolation alpha
+    float FrameF = ElapsedTime * (float)FPS;
+    int32 Frame0 = FMath::FloorToInt(FrameF);
+    float Alpha = FrameF - (float)Frame0;
+    int32 Frame1 = Frame0 + 1;
+
+    // Apply position
+    if (PosKeys.Num() > 0) {
+      Frame0 = FMath::Clamp(Frame0, 0, PosKeys.Num() - 1);
+      Frame1 = FMath::Clamp(Frame1, 0, PosKeys.Num() - 1);
+      FVector Pos = FMath::Lerp(PosKeys[Frame0], PosKeys[Frame1], Alpha);
+      TargetComponent->SetRelativeLocation(Pos);
+    }
+
+    // Apply rotation
+    if (RotKeys.Num() > 0) {
+      Frame0 = FMath::Clamp(FMath::FloorToInt(FrameF), 0, RotKeys.Num() - 1);
+      Frame1 = FMath::Clamp(Frame0 + 1, 0, RotKeys.Num() - 1);
+      FQuat Rot = FQuat::Slerp(RotKeys[Frame0], RotKeys[Frame1], Alpha);
+      TargetComponent->SetRelativeRotation(Rot.Rotator());
+    }
+
+    // Apply scale
+    if (ScaleKeys.Num() > 0) {
+      Frame0 = FMath::Clamp(FMath::FloorToInt(FrameF), 0, ScaleKeys.Num() - 1);
+      Frame1 = FMath::Clamp(Frame0 + 1, 0, ScaleKeys.Num() - 1);
+      FVector Scl = FMath::Lerp(ScaleKeys[Frame0], ScaleKeys[Frame1], Alpha);
+      TargetComponent->SetRelativeScale3D(Scl);
+    }
+  }
+};
+
 // DECLARE_LOG_CATEGORY_EXTERN(LogRoseImporter, Log, All);
 
 /**
@@ -72,6 +152,7 @@ private:
   // Loaded ZSC Data
   FRoseZSC DecoZSC;
   FRoseZSC CnstZSC;
+  FRoseZSC AnimZSC; // Dynamically discovered (Type 6 objects)
 
   // HISM Management
   TMap<UStaticMesh *, UHierarchicalInstancedStaticMeshComponent *>
@@ -133,6 +214,9 @@ private:
                       const FVector &TileOffset, int32 MinX, int32 MinY,
                       int32 ZoneWidth, int32 ZoneHeight);
 
+  void SpawnAnimatedObject(UStaticMesh *Mesh, const FTransform &Transform,
+                           const FString &AnimPath, UWorld *World);
+
   UHierarchicalInstancedStaticMeshComponent *
   GetOrCreateHISM(UStaticMesh *Mesh, UMaterialInterface *Material);
 
@@ -141,4 +225,7 @@ private:
 
   // Cache to avoid redundant material saves
   TSet<FString> ProcessedMaterialPaths;
+
+  // Fast in-memory texture cache (avoids redundant DDS loads)
+  TMap<FString, UTexture2D *> TextureCache;
 };
