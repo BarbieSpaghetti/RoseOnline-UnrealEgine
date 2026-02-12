@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
   "Version": 1,
-  "VersionName": "1.0",
-  "FriendlyName": "Bonsoir ROSE Importer",
-  "Description": "Import ROSE Online game assets (maps, meshes, textures) into Unreal Engine",
+  "VersionName": "1.1",
+  "FriendlyName": "BonsoirUnreal",
+  "Description": "ROSE Online Zone Importer (Release 1.1 - Animation Fixes, Flags Support, Collision Updates)",
   "Category": "Importers",
   "CreatedBy": "BarbieSpaghetti",
   "CreatedByURL": "",

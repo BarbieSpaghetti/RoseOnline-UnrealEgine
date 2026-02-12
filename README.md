@@ -4,6 +4,21 @@ Import **ROSE Online** game assets (maps, terrain, objects, textures) directly i
 
 ---
 
+## 🆕 Release 1.1 Changelog (February 2026)
+
+### Added
+- **IFO Animation Support**: Now parses Type 6 blocks (`Animation`) from `.IFO` files.
+- **Dynamic ZSC Discovery**: Automatically finds special object lists (e.g., `EVENT_OBJECT.ZSC`, `LIST_DECO_SPECIAL.ZSC`) to correctly load flags and animated props.
+- **Animation Preview**: Animations now play automatically in the **Editor Viewport** (`bTickInEditor` enabled).
+
+### Fixed
+- **Animation System**: Fixed excessive deformation by limiting animation application to **Root Bone (ID 0)** only.
+- **Collision**: Disabled collision for `grass` objects to prevent player obstruction.
+- **Mesh Import**: Enabled **"Recompute Tangents"** to fix rendering artifacts (degenerate tangents).
+- **Zone Browser**: Improved column detection for `.ZON` files in the import dialog.
+
+---
+
 ## Prerequisites
 
 | Requirement | Version |
@@ -106,14 +121,25 @@ To re-import a zone:
 
 ---
 
+## Troubleshooting
+
+| Issue | Solution |
+|---|---|
+| **Gray textures** | Delete `/Game/Rose/Imported/Materials/` and re-import |
+| **Missing objects** | Ensure the ROSE client has complete `3DData/` folder |
+| **Objects facing wrong direction** | Delete `/Game/Rose/Imported/Meshes/` and re-import |
+| **No terrain** | Check that `.HIM` files exist alongside the `.ZON` file |
+| **"Failed to load ZSCs"** | Verify `3DData/STB/LIST_ZONE.STB` exists in your ROSE client |
+
+---
+
 ## Credits
 
 - **Author:** BarbieSpaghetti
-- **Version:** 1.0
+- **Version:** 1.1
 - **Engine:** Unreal Engine 5.7
 - **License:** Private
 
 ---
 
 *Built with ❤️ for the ROSE Online community*
-
