@@ -1,0 +1,25 @@
+{
+  "FileVersion": 3,
+  "Version": 1,
+  "VersionName": "1.0",
+  "FriendlyName": "Bonsoir ROSE Importer",
+  "Description": "Import ROSE Online game assets (maps, meshes, textures) into Unreal Engine",
+  "Category": "Importers",
+  "CreatedBy": "BarbieSpaghetti",
+  "CreatedByURL": "",
+  "DocsURL": "",
+  "MarketplaceURL": "",
+  "SupportURL": "",
+  "CanContainContent": true,
+  "IsBetaVersion": false,
+  "IsExperimentalVersion": false,
+  "Installed": false,
+  "Icon128": "Content/Collections/Bonsoir.png",
+  "Modules": [
+    {
+      "Name": "BonsoirUnreal",
+      "Type": "Editor",
+      "LoadingPhase": "Default"
+    }
+  ]
+}

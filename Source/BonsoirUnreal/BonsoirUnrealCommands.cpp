@@ -1,0 +1,11 @@
+#include "BonsoirUnrealCommands.h"
+
+#define LOCTEXT_NAMESPACE "FBonsoirUnrealModule"
+
+void FBonsoirUnrealCommands::RegisterCommands() {
+  UI_COMMAND(ImportZoneAction, "Import ROSE Zone",
+             "Import a ROSE Online .ZON file", EUserInterfaceActionType::Button,
+             FInputChord());
+}
+
+#undef LOCTEXT_NAMESPACE
