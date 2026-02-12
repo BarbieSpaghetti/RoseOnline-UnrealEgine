@@ -121,18 +121,6 @@ To re-import a zone:
 
 ---
 
-## Troubleshooting
-
-| Issue | Solution |
-|---|---|
-| **Gray textures** | Delete `/Game/Rose/Imported/Materials/` and re-import |
-| **Missing objects** | Ensure the ROSE client has complete `3DData/` folder |
-| **Objects facing wrong direction** | Delete `/Game/Rose/Imported/Meshes/` and re-import |
-| **No terrain** | Check that `.HIM` files exist alongside the `.ZON` file |
-| **"Failed to load ZSCs"** | Verify `3DData/STB/LIST_ZONE.STB` exists in your ROSE client |
-
----
-
 ## Credits
 
 - **Author:** BarbieSpaghetti
@@ -143,3 +131,4 @@ To re-import a zone:
 ---
 
 *Built with ❤️ for the ROSE Online community*
+
