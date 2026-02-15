@@ -118,7 +118,9 @@ void FBonsoirUnrealModule::OnImportZoneClicked() {
         // Import
         URoseImporter *Importer = NewObject<URoseImporter>();
         if (Importer) {
+          Importer->AddToRoot(); // Prevent GC during long import
           bool bSuccess = Importer->ImportZone(ZonePathToImport);
+          Importer->RemoveFromRoot();
 
           if (bSuccess) {
             FMessageDialog::Open(

@@ -155,8 +155,11 @@ private:
   FRoseZSC AnimZSC; // Dynamically discovered (Type 6 objects)
 
   // HISM Management
+  UPROPERTY()
   TMap<UStaticMesh *, UHierarchicalInstancedStaticMeshComponent *>
       GlobalHISMMap;
+
+  UPROPERTY()
   AActor *ZoneObjectsActor = nullptr;
 
   // Helper Functions
@@ -174,6 +177,7 @@ private:
   // Helper for DXT decompression
   void DecompressDXT3Block(const uint8 *B, uint8 *D, int32 S);
   void DecompressDXT1Block(const uint8 *B, uint8 *D, int32 S);
+  void DecompressDXT5Block(const uint8 *B, uint8 *D, int32 S); // DXT5 Support
   UTexture2D *CreateTextureAssetDXT(UObject *Outer, FName Name, int32 W,
                                     int32 H, EPixelFormat F,
                                     const TArray<uint8> &D);
@@ -214,6 +218,11 @@ private:
                       const FVector &TileOffset, int32 MinX, int32 MinY,
                       int32 ZoneWidth, int32 ZoneHeight);
 
+  // TileSet Mapping Helpers
+  UTexture2D *CreateTileMapDataTexture(const FRoseTIL &TIL, const FRoseZON &ZON,
+                                       const FString &TileName);
+  bool GetBrushUVOffset(int32 TileID, int32 &OutU, int32 &OutV) const;
+
   void SpawnAnimatedObject(UStaticMesh *Mesh, const FTransform &Transform,
                            const FString &AnimPath, UWorld *World);
 
@@ -225,6 +234,8 @@ private:
 
   // Cache to avoid redundant material saves
   TSet<FString> ProcessedMaterialPaths;
+
+  // Texture Utils
 
   // Fast in-memory texture cache (avoids redundant DDS loads)
   TMap<FString, UTexture2D *> TextureCache;

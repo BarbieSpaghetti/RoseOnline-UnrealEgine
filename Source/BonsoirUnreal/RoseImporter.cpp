@@ -5,12 +5,13 @@
 #include "AssetToolsModule.h"
 #include "BonsoirUnrealLog.h"
 #include "Components/HierarchicalInstancedStaticMeshComponent.h"
-#include "Components/StaticMeshComponent.h"
+#include "Components/InstancedStaticMeshComponent.h"
 #include "ContentBrowserModule.h"
 #include "DrawDebugHelpers.h"
 #include "EditorFramework/AssetImportData.h"
 #include "Engine/StaticMesh.h"
 #include "Engine/StaticMeshActor.h"
+#include "Engine/Texture2D.h"
 #include "Engine/World.h"
 #include "EngineUtils.h"
 #include "Exporters/Exporter.h"
@@ -30,12 +31,19 @@
 #include "Landscape.h"
 #include "LandscapeEditLayer.h"
 #include "Materials/Material.h"
+#include "Materials/MaterialExpressionAdd.h"
+#include "Materials/MaterialExpressionComponentMask.h"
+#include "Materials/MaterialExpressionConstant.h"
+#include "Materials/MaterialExpressionConstant3Vector.h" // Added for Fallback Layer
+
+#include "Materials/MaterialExpressionFrac.h"
 #include "Materials/MaterialExpressionLandscapeLayerBlend.h"
 #include "Materials/MaterialExpressionLandscapeLayerCoords.h"
 #include "Materials/MaterialExpressionLinearInterpolate.h"
 #include "Materials/MaterialExpressionMultiply.h"
 #include "Materials/MaterialExpressionRotator.h"
 #include "Materials/MaterialExpressionScalarParameter.h"
+#include "Materials/MaterialExpressionTextureSample.h"
 #include "Materials/MaterialExpressionTextureSampleParameter2D.h"
 #include "Materials/MaterialExpressionVectorParameter.h"
 #include "Materials/MaterialExpressionVertexColor.h"
@@ -310,158 +318,135 @@ bool URoseImporter::ImportZone(const FString &ZONPath) {
 UMaterial *
 URoseImporter::CreateLandscapeMaterial(const FRoseZON &ZON,
                                        const TArray<FLoadedTile> &AllTiles) {
-  // 1. Analyze TIL data to find unique (TexID1, TexID2) texture pairs
-  // Use int64 as key to avoid hash function issues: (TexID1 << 32) | TexID2
-  TMap<int64, int32> TexturePairFrequency;
+  FString MatName = FString::Printf(TEXT("M_Zone_%d_Unified"), ZON.ZoneType);
+  FString PackageName = TEXT("/Game/Rose/Imported/Materials/") + MatName;
 
+  UPackage *Package = CreatePackage(*PackageName);
+  UMaterial *Material =
+      NewObject<UMaterial>(Package, *MatName, RF_Public | RF_Standalone);
+
+  if (!Material)
+    return nullptr;
+
+  Material->NumCustomizedUVs = 4;
+  // Material->bUsedWithLandscape = true;
+  // Material->bUsedWithStaticLighting = true;
+
+  // 1. Create Base UVs (LandscapeCoords)
+  UMaterialExpressionLandscapeLayerCoords *BaseUVs =
+      NewObject<UMaterialExpressionLandscapeLayerCoords>(Material);
+  BaseUVs->MappingType = TCMT_Auto;
+  BaseUVs->CustomUVType = LCCT_CustomUV0;
+  BaseUVs->MappingScale = 1.0f;
+  Material->GetExpressionCollection().AddExpression(BaseUVs);
+
+  // Scaled UVs (0.25f)
+  UMaterialExpressionConstant *Tiling =
+      NewObject<UMaterialExpressionConstant>(Material);
+  Tiling->R = 0.25f;
+  Material->GetExpressionCollection().AddExpression(Tiling);
+
+  UMaterialExpressionMultiply *ScaledUVs =
+      NewObject<UMaterialExpressionMultiply>(Material);
+  ScaledUVs->A.Expression = BaseUVs;
+  ScaledUVs->B.Expression = Tiling;
+  Material->GetExpressionCollection().AddExpression(ScaledUVs);
+
+  // FINAL UVs
+  UMaterialExpression *FinalUVs = ScaledUVs;
+
+  // 2. Analyze Textures
+  TMap<int32, int32> GlobalTexCounts;
   for (const FLoadedTile &Tile : AllTiles) {
     for (const FRoseTilePatch &Patch : Tile.TIL.Patches) {
-      // Use Patch.Tile (TileID) to lookup in ZON.Tiles array
-      int32 TileID = Patch.Tile;
-
-      if (TileID >= 0 && TileID < ZON.Tiles.Num()) {
-        // Get the TWO texture indices for this tile
-        int32 TexID1 = ZON.Tiles[TileID].GetTextureID1();
-        int32 TexID2 = ZON.Tiles[TileID].GetTextureID2();
-
-        // Use only TexID1 (base texture) for now
-        // Future: implement dual-texture blending
-        int64 Key = ((int64)TexID1 << 32) | (int64)TexID1;
-
-        int32 &Count = TexturePairFrequency.FindOrAdd(Key, 0);
-        Count++;
+      int32 TexID = -1;
+      if (Patch.Tile >= 0 && Patch.Tile < ZON.Tiles.Num()) {
+        TexID = ZON.Tiles[Patch.Tile].GetTextureID1();
+        int32 TexID2 = ZON.Tiles[Patch.Tile].GetTextureID2();
+        if (TexID2 >= 0)
+          GlobalTexCounts.FindOrAdd(TexID2)++;
       }
+      if (TexID >= 0)
+        GlobalTexCounts.FindOrAdd(TexID)++;
     }
   }
 
-  UE_LOG(LogRoseImporter, Log, TEXT("Found %d unique texture pairs"),
-         TexturePairFrequency.Num());
-
-  // 2. Sort texture pairs by frequency (most common first)
-  struct FTexturePair {
-    int32 TexID1;
-    int32 TexID2;
+  // Sort
+  struct FTexSort {
+    int32 ID;
     int32 Count;
   };
+  TArray<FTexSort> SortedTex;
+  for (auto &Elem : GlobalTexCounts)
+    SortedTex.Add({Elem.Key, Elem.Value});
+  SortedTex.Sort(
+      [](const FTexSort &A, const FTexSort &B) { return A.Count > B.Count; });
 
-  TArray<FTexturePair> AllPairs;
-  for (const auto &Pair : TexturePairFrequency) {
-    FTexturePair TexPair;
-    TexPair.TexID1 = (int32)(Pair.Key >> 32);
-    TexPair.TexID2 = (int32)(Pair.Key & 0xFFFFFFFF);
-    TexPair.Count = Pair.Value;
-    AllPairs.Add(TexPair);
-  }
-
-  AllPairs.Sort([](const FTexturePair &A, const FTexturePair &B) {
-    return A.Count > B.Count; // Descending by frequency
-  });
-
-  // 3. Select top N pairs (limit for performance and shader samplers)
-  // Tried 24 layers to reduce texture mismatch
-  const int32 MaxLayers = 24;
-  int32 NumLayersToCreate = FMath::Min(AllPairs.Num(), MaxLayers);
-
-  TArray<FTexturePair> SelectedPairs;
-  for (int32 i = 0; i < NumLayersToCreate; ++i) {
-    SelectedPairs.Add(AllPairs[i]);
-
-    UE_LOG(LogRoseImporter, Log,
-           TEXT("Layer %d: Texture %d (used in %d patches, %.1f%%)"), i,
-           AllPairs[i].TexID1, AllPairs[i].Count,
-           (float)AllPairs[i].Count * 100.0f /
-               (AllTiles.Num() * 16.0f * 16.0f));
-  }
-
-  UE_LOG(LogRoseImporter, Log,
-         TEXT("Creating %d landscape layers from texture analysis"),
-         NumLayersToCreate);
-
-  // 3. Create the Material asset
-  FString MaterialName = TEXT("M_RoseLandscape");
-  FString MaterialPackageName = TEXT("/Game/ROSE/Materials/") + MaterialName;
-
-  UPackage *MaterialPackage = CreatePackage(*MaterialPackageName);
-  UMaterialFactoryNew *MaterialFactory = NewObject<UMaterialFactoryNew>();
-
-  UMaterial *Material = (UMaterial *)MaterialFactory->FactoryCreateNew(
-      UMaterial::StaticClass(), MaterialPackage, *MaterialName,
-      RF_Standalone | RF_Public, nullptr, GWarn);
-
-  if (!Material) {
-    UE_LOG(LogRoseImporter, Error, TEXT("Failed to create landscape material"));
-    return nullptr;
-  }
-
-  // 4. Create LandscapeLayerBlend node
+  // 3. Create Layer Blend
   UMaterialExpressionLandscapeLayerBlend *LayerBlend =
       NewObject<UMaterialExpressionLandscapeLayerBlend>(Material);
   Material->GetExpressionCollection().AddExpression(LayerBlend);
-  LayerBlend->MaterialExpressionEditorX = -400;
-  LayerBlend->MaterialExpressionEditorY = 0;
 
-  // 5. Create texture samplers for each selected texture pair
-  int32 YOffset = 0;
-  int32 LayerIndex = 0;
+  // 4. Create Layers (Limit to 64 -
+  // Shared Samplers allow up to 128)
+  int32 LayerLimit = FMath::Min(SortedTex.Num(), 64);
 
-  for (const FTexturePair &Pair : SelectedPairs) {
-    // Create a new layer in the blend node
+  for (int32 i = 0; i < LayerLimit; ++i) {
+    int32 TexID = SortedTex[i].ID;
+    FString LayerName = FString::Printf(TEXT("T%d"), TexID);
+
     FLayerBlendInput &Layer = LayerBlend->Layers.AddDefaulted_GetRef();
-    FString LayerName = FString::Printf(TEXT("T%d"), Pair.TexID1);
     Layer.LayerName = FName(*LayerName);
+    Layer.BlendType = LB_HeightBlend; // Changed from
+                                      // WeightBlend to
+                                      // HeightBlend
+    Layer.PreviewWeight = (i == 0) ? 1.0f : 0.0f;
 
-    // Use LB_WeightBlend for ALL layers to ensure correct normalization
-    // This allows using arbitrary weight values (like 50) without transparency
-    // issues
-    Layer.BlendType = LB_WeightBlend;
-    Layer.ConstLayerInput = FVector(0, 0, 0);
-
-    /* REMOVED AlphaBlend special case for first layer */
-
-    // Create texture sample parameter
+    // Texture Sampler
     UMaterialExpressionTextureSampleParameter2D *TexSample =
         NewObject<UMaterialExpressionTextureSampleParameter2D>(Material);
     Material->GetExpressionCollection().AddExpression(TexSample);
-    TexSample->MaterialExpressionEditorX = -800;
-    TexSample->MaterialExpressionEditorY = YOffset;
     TexSample->ParameterName =
         FName(*FString::Printf(TEXT("Tex_%s"), *LayerName));
+    TexSample->SamplerSource = SSM_Wrap_WorldGroupSettings;
+    TexSample->Coordinates.Expression = FinalUVs; // USE ROTATED UVS
 
-    // Load the texture using TexID1 (base texture)
-    int32 TextureIdx = Pair.TexID1;
-    if (TextureIdx >= 0 && TextureIdx < ZON.Textures.Num()) {
-      FString TexturePath = ZON.Textures[TextureIdx];
-      UTexture *LoadedTexture = LoadRoseTexture(TexturePath);
-      if (LoadedTexture) {
-        TexSample->Texture = LoadedTexture;
-        UE_LOG(LogRoseImporter, Log, TEXT("Layer %s: loaded texture %s"),
-               *LayerName, *TexturePath);
-      }
+    // Load Texture
+    UTexture *TextureToUse = nullptr;
+    if (TexID >= 0 && TexID < ZON.Textures.Num()) {
+      TextureToUse = this->LoadRoseTexture(ZON.Textures[TexID]);
     }
 
-    // Create UV coordinate scaling (LandscapeCoords)
-    UMaterialExpressionLandscapeLayerCoords *UVCoords =
-        NewObject<UMaterialExpressionLandscapeLayerCoords>(Material);
-    Material->GetExpressionCollection().AddExpression(UVCoords);
-    UVCoords->MaterialExpressionEditorX = -1100;
-    UVCoords->MaterialExpressionEditorY = YOffset;
-    UVCoords->MappingScale = 1.0f;
-    UVCoords->MappingType = TCMT_Auto;
+    if (!TextureToUse) {
+      TextureToUse = GEngine->DefaultTexture;
+      UE_LOG(LogRoseImporter, Warning,
+             TEXT("Layer %s missing "
+                  "texture, using Default."),
+             *LayerName);
+    }
 
-    // Connect UV to texture sampler
-    TexSample->Coordinates.Expression = UVCoords;
+    TexSample->Texture = TextureToUse;
 
-    // Connect texture to layer blend
+    // Connect RGB to Layer Input (Index
+    // 0)
     Layer.LayerInput.Expression = TexSample;
+    Layer.LayerInput.OutputIndex = 0;
 
-    YOffset += 250;
-    LayerIndex++; // Increment for next layer
+    // Connect Alpha to Height Input
+    // (Index 4)
+    Layer.HeightInput.Expression = TexSample;
+    Layer.HeightInput.OutputIndex = 4;
   }
 
-  // 6. Connect LayerBlend to material's Base Color
+  // 5. Connect
   Material->GetExpressionInputForProperty(MP_BaseColor)->Connect(0, LayerBlend);
 
+  // 6. REMOVED Debug Emissive (Green) to
+  // show actual material colors
+
   // 7. Update and compile the material
+  Material->bUsedWithStaticLighting = true;
+
   Material->PreEditChange(nullptr);
   Material->PostEditChange();
   Material->MarkPackageDirty();
@@ -469,13 +454,15 @@ URoseImporter::CreateLandscapeMaterial(const FRoseZON &ZON,
   FAssetRegistryModule::AssetCreated(Material);
 
   UE_LOG(LogRoseImporter, Log,
-         TEXT("Created landscape material with %d layers"),
+         TEXT("Created LANDSCAPE MATERIAL "
+              "with %d layers (Simple UVs)"),
          LayerBlend->Layers.Num());
 
   return Material;
 }
 
-// Create a simple material to preview vertex colors (debug)
+// Create a simple material to preview
+// vertex colors (debug)
 UMaterial *URoseImporter::CreateVertexColorPreviewMaterial() {
   FString MaterialName = TEXT("M_VertexColorPreview");
   FString MaterialPackageName = TEXT("/Game/ROSE/Materials/") + MaterialName;
@@ -488,7 +475,9 @@ UMaterial *URoseImporter::CreateVertexColorPreviewMaterial() {
       RF_Standalone | RF_Public, nullptr, GWarn);
 
   if (!Material) {
-    UE_LOG(LogRoseImporter, Error, TEXT("Failed to create preview material"));
+    UE_LOG(LogRoseImporter, Error,
+           TEXT("Failed to create "
+                "preview material"));
     return nullptr;
   }
 
@@ -499,8 +488,9 @@ UMaterial *URoseImporter::CreateVertexColorPreviewMaterial() {
   VertexColor->MaterialExpressionEditorX = -400;
   VertexColor->MaterialExpressionEditorY = 0;
 
-  // Connect RGB directly to Base Color for visualization
-  // R = TextureID1, G = TextureID2, B = BlendFactor
+  // Connect RGB directly to Base Color
+  // for visualization R = TextureID1, G
+  // = TextureID2, B = BlendFactor
   Material->GetExpressionInputForProperty(MP_BaseColor)
       ->Connect(0, VertexColor);
 
@@ -511,16 +501,20 @@ UMaterial *URoseImporter::CreateVertexColorPreviewMaterial() {
 
   FAssetRegistryModule::AssetCreated(Material);
 
-  UE_LOG(LogRoseImporter, Log, TEXT("Created vertex color preview material"));
+  UE_LOG(LogRoseImporter, Log,
+         TEXT("Created vertex color "
+              "preview material"));
 
   return Material;
 }
 
-// Create test material that blends 2 most frequent textures
+// Create test material that blends 2
+// most frequent textures
 UMaterial *URoseImporter::CreateDualTextureTestMaterial(
     const FRoseZON &ZON, const TArray<FLoadedTile> &AllTiles) {
 
-  // Analyze to find top 2 most frequent textures
+  // Analyze to find top 2 most frequent
+  // textures
   TMap<int32, int32> TexIDFrequency;
 
   for (const FLoadedTile &Tile : AllTiles) {
@@ -546,25 +540,30 @@ UMaterial *URoseImporter::CreateDualTextureTestMaterial(
 
   if (Sorted.Num() < 2) {
     UE_LOG(LogRoseImporter, Warning,
-           TEXT("Not enough textures found for dual-texture test material"));
+           TEXT("Not enough textures "
+                "found for dual-texture "
+                "test material"));
     return nullptr;
   }
 
   int32 TopTexID1 = Sorted[0].Key;
   int32 TopTexID2 = Sorted[1].Key;
 
-  UE_LOG(
-      LogRoseImporter, Log,
-      TEXT("Creating test material with textures %d (%.1f%%) and %d (%.1f%%)"),
-      TopTexID1, Sorted[0].Value * 100.0f / AllTiles.Num() / 256, TopTexID2,
-      Sorted[1].Value * 100.0f / AllTiles.Num() / 256);
+  UE_LOG(LogRoseImporter, Log,
+         TEXT("Creating test material with "
+              "textures %d (%.1f%%) and %d "
+              "(%.1f%%)"),
+         TopTexID1, Sorted[0].Value * 100.0f / AllTiles.Num() / 256, TopTexID2,
+         Sorted[1].Value * 100.0f / AllTiles.Num() / 256);
 
   // Load the 2 textures
   UTexture *Tex1 = LoadRoseTexture(ZON.Textures[TopTexID1]);
   UTexture *Tex2 = LoadRoseTexture(ZON.Textures[TopTexID2]);
 
   if (!Tex1 || !Tex2) {
-    UE_LOG(LogRoseImporter, Error, TEXT("Failed to load test textures"));
+    UE_LOG(LogRoseImporter, Error,
+           TEXT("Failed to load test "
+                "textures"));
     return nullptr;
   }
 
@@ -640,29 +639,40 @@ UMaterial *URoseImporter::CreateDualTextureTestMaterial(
 
   FAssetRegistryModule::AssetCreated(Material);
 
-  UE_LOG(LogRoseImporter, Log, TEXT("Created dual-texture test material"));
+  UE_LOG(LogRoseImporter, Log,
+         TEXT("Created dual-texture "
+              "test material"));
 
   return Material;
 }
 
-// Create production material with switch-based texture selection (top 12)
+// Create production material with
+// switch-based texture selection (top
+// 12)
 UMaterial *URoseImporter::CreateSwitchBasedDualTextureMaterial(
     const FRoseZON &ZON, const TArray<FLoadedTile> &AllTiles) {
 
   UE_LOG(LogRoseImporter, Log,
-         TEXT("CreateSwitchBasedDualTextureMaterial called"));
+         TEXT("CreateSwitchBasedDualText"
+              "ureMaterial called"));
 
-  // NOTE: Full implementation requires ~300+ lines of if/else cascade
-  // For now, returning the simpler dual-texture test material
-  // TODO: Implement complete switch logic with 12 textures
+  // NOTE: Full implementation requires
+  // ~300+ lines of if/else cascade For
+  // now, returning the simpler
+  // dual-texture test material
+  // TODO: Implement complete switch
+  // logic with 12 textures
 
   UE_LOG(LogRoseImporter, Warning,
-         TEXT("Switch-based material stub - returning test material instead"));
+         TEXT("Switch-based material "
+              "stub - returning test "
+              "material instead"));
 
   return CreateDualTextureTestMaterial(ZON, AllTiles);
 }
 
-// Create a Deferred Decal material for transparency effects
+// Create a Deferred Decal material for
+// transparency effects
 UMaterial *URoseImporter::CreateDecalMaterial(UTexture2D *Texture,
                                               int32 TexID) {
   if (!Texture) {
@@ -670,8 +680,9 @@ UMaterial *URoseImporter::CreateDecalMaterial(UTexture2D *Texture,
   }
 
   FString MaterialName = FString::Printf(TEXT("M_Decal_T%d"), TexID);
-  FString MaterialPackageName =
-      TEXT("/Game/ROSE/Materials/Decals/") + MaterialName;
+  FString MaterialPackageName = TEXT("/Game/ROSE/Materials/"
+                                     "Decals/") +
+                                MaterialName;
 
   // Check if already exists
   if (UMaterial *ExistingMaterial =
@@ -688,7 +699,9 @@ UMaterial *URoseImporter::CreateDecalMaterial(UTexture2D *Texture,
 
   if (!Material) {
     UE_LOG(LogRoseImporter, Error,
-           TEXT("Failed to create decal material for T%d"), TexID);
+           TEXT("Failed to create decal "
+                "material for T%d"),
+           TexID);
     return nullptr;
   }
 
@@ -710,7 +723,8 @@ UMaterial *URoseImporter::CreateDecalMaterial(UTexture2D *Texture,
   // Connect RGB to Base Color (output 0)
   Material->GetExpressionInputForProperty(MP_BaseColor)->Connect(0, TexSample);
 
-  // Connect Alpha to Opacity (output 4 = alpha channel)
+  // Connect Alpha to Opacity (output 4 =
+  // alpha channel)
   Material->GetExpressionInputForProperty(MP_Opacity)->Connect(4, TexSample);
 
   // Compile and save
@@ -726,7 +740,8 @@ UMaterial *URoseImporter::CreateDecalMaterial(UTexture2D *Texture,
   return Material;
 }
 
-// Spawn decal actors for textures with alpha transparency
+// Spawn decal actors for textures with
+// alpha transparency
 void URoseImporter::SpawnDecalsForTextures(UWorld *World, const FRoseZON &ZON,
                                            const TArray<FLoadedTile> &AllTiles,
                                            int32 MinX, int32 MinY) {
@@ -734,7 +749,9 @@ void URoseImporter::SpawnDecalsForTextures(UWorld *World, const FRoseZON &ZON,
     return;
   }
 
-  UE_LOG(LogRoseImporter, Log, TEXT("Spawning decals for alpha textures..."));
+  UE_LOG(LogRoseImporter, Log,
+         TEXT("Spawning decals for "
+              "alpha textures..."));
 
   // Structure to track decal placements
   struct FDecalPlacement {
@@ -745,7 +762,8 @@ void URoseImporter::SpawnDecalsForTextures(UWorld *World, const FRoseZON &ZON,
 
   TArray<FDecalPlacement> DecalPlacements;
 
-  // Analyze all tiles and patches to find textures that need decals
+  // Analyze all tiles and patches to
+  // find textures that need decals
   for (const FLoadedTile &Tile : AllTiles) {
     for (int32 py = 0; py < 16; ++py) {
       for (int32 px = 0; px < 16; ++px) {
@@ -761,49 +779,64 @@ void URoseImporter::SpawnDecalsForTextures(UWorld *World, const FRoseZON &ZON,
 
         int32 TexID1 = ZON.Tiles[TileID].GetTextureID1();
 
-        // For now, spawn decals for all textured patches
-        // TODO: Filter only textures with significant alpha
+        // For now, spawn decals for all
+        // textured patches
+        // TODO: Filter only textures
+        // with significant alpha
 
-        // Calculate world position for this patch
-        // Each patch is 4x4 meters in ROSE
+        // Calculate world position for
+        // this patch Each patch is 4x4
+        // meters in ROSE
         float PatchWorldX = ((Tile.X - MinX) * 64) + (px * 4);
         float PatchWorldY = ((Tile.Y - MinY) * 64) + (py * 4);
 
-        // ROSE to Unreal conversion: swap Y/Z, scale
+        // ROSE to Unreal conversion:
+        // swap Y/Z, scale
         float UnrealX = PatchWorldX * 100.0f; // cm
         float UnrealY = PatchWorldY * 100.0f; // cm
-        float UnrealZ = 1000.0f;              // Spawn above terrain
+        float UnrealZ = 1000.0f;              // Spawn above
+                                              // terrain
 
         FDecalPlacement Decal;
         Decal.TexID = TexID1;
         Decal.WorldLocation = FVector(UnrealX, UnrealY, UnrealZ);
-        Decal.Size = FVector2D(400.0f, 400.0f); // 4m = 400cm
+        Decal.Size = FVector2D(400.0f,
+                               400.0f); // 4m = 400cm
 
         DecalPlacements.Add(Decal);
       }
     }
   }
 
-  UE_LOG(LogRoseImporter, Log, TEXT("Found %d potential decal placements"),
+  UE_LOG(LogRoseImporter, Log,
+         TEXT("Found %d potential decal "
+              "placements"),
          DecalPlacements.Num());
 
-  // Limit decals for performance (TODO: implement merging/optimization)
-  int32 MaxDecals = 100; // Conservative limit for testing
+  // Limit decals for performance (TODO:
+  // implement merging/optimization)
+  int32 MaxDecals = 100; // Conservative limit for
+                         // testing
   if (DecalPlacements.Num() > MaxDecals) {
     UE_LOG(LogRoseImporter, Warning,
-           TEXT("Limiting decals from %d to %d for performance"),
+           TEXT("Limiting decals from %d "
+                "to %d for performance"),
            DecalPlacements.Num(), MaxDecals);
     DecalPlacements.SetNum(MaxDecals);
   }
 
-  // TODO: Spawning will be implemented in next phase
-  // For now, just log that we would spawn decals
+  // TODO: Spawning will be implemented
+  // in next phase For now, just log that
+  // we would spawn decals
   UE_LOG(LogRoseImporter, Log,
-         TEXT("Decal spawning ready - %d decals prepared (spawn code TODO)"),
+         TEXT("Decal spawning ready - "
+              "%d decals prepared "
+              "(spawn code TODO)"),
          DecalPlacements.Num());
 }
 
-// Setup vertex colors for dual-texture blending
+// Setup vertex colors for dual-texture
+// blending
 void URoseImporter::SetupVertexColors(ALandscape *Landscape,
                                       const TArray<FLoadedTile> &AllTiles,
                                       const FRoseZON &ZON, int32 MinX,
@@ -813,9 +846,11 @@ void URoseImporter::SetupVertexColors(ALandscape *Landscape,
   }
 
   UE_LOG(LogRoseImporter, Log,
-         TEXT("Setting up vertex colors for dual-texture blending..."));
+         TEXT("Setting up vertex colors for "
+              "dual-texture blending..."));
 
-  // Create a map for fast tile lookup by coordinates
+  // Create a map for fast tile lookup by
+  // coordinates
   TMap<FIntPoint, const FLoadedTile *> TileMap;
   for (const FLoadedTile &Tile : AllTiles) {
     TileMap.Add(FIntPoint(Tile.X, Tile.Y), &Tile);
@@ -826,7 +861,9 @@ void URoseImporter::SetupVertexColors(ALandscape *Landscape,
   Landscape->GetComponents(LandscapeComponents);
 
   if (LandscapeComponents.Num() == 0) {
-    UE_LOG(LogRoseImporter, Warning, TEXT("No landscape components found"));
+    UE_LOG(LogRoseImporter, Warning,
+           TEXT("No landscape "
+                "components found"));
     return;
   }
 
@@ -846,7 +883,8 @@ void URoseImporter::SetupVertexColors(ALandscape *Landscape,
     TArray<FColor> VertexColors;
     VertexColors.SetNum(VertexCount);
 
-    // Get component's section base (offset in landscape)
+    // Get component's section base
+    // (offset in landscape)
     FIntPoint ComponentBase = Component->GetSectionBase();
 
     // For each vertex in component
@@ -854,15 +892,20 @@ void URoseImporter::SetupVertexColors(ALandscape *Landscape,
       for (int32 VertexX = 0; VertexX < VerticesPerSide; ++VertexX) {
         int32 VertexIdx = VertexY * VerticesPerSide + VertexX;
 
-        // Calculate landscape-space coordinates of this vertex
+        // Calculate landscape-space
+        // coordinates of this vertex
         int32 LandscapeX = ComponentBase.X + VertexX;
         int32 LandscapeY = ComponentBase.Y + VertexY;
 
-        // Convert to ROSE tile coordinates (64 vertices per tile)
+        // Convert to ROSE tile
+        // coordinates (64 vertices per
+        // tile)
         int32 RoseTileX = MinX + (LandscapeX / 64);
         int32 RoseTileY = MinY + (LandscapeY / 64);
 
-        // Convert to patch coordinates within tile (16 patches per tile)
+        // Convert to patch coordinates
+        // within tile (16 patches per
+        // tile)
         int32 LocalVertexX = LandscapeX % 64;
         int32 LocalVertexY = LandscapeY % 64;
         int32 PatchX = LocalVertexX / 4; // 4 vertices per patch
@@ -892,8 +935,9 @@ void URoseImporter::SetupVertexColors(ALandscape *Landscape,
               TexID2 = (uint8)FMath::Clamp(ZON.Tiles[TileID].GetTextureID2(), 0,
                                            255);
 
-              // Determine blend factor (simple: 50/50 if blending, else 100%
-              // ID1)
+              // Determine blend factor
+              // (simple: 50/50 if
+              // blending, else 100% ID1)
               if (ZON.Tiles[TileID].IsBlending()) {
                 BlendFactor = 128; // 50% blend
               } else {
@@ -903,19 +947,25 @@ void URoseImporter::SetupVertexColors(ALandscape *Landscape,
           }
         }
 
-        // Encode in vertex color: R=ID1, G=ID2, B=BlendFactor, A=255
+        // Encode in vertex color: R=ID1,
+        // G=ID2, B=BlendFactor, A=255
         VertexColors[VertexIdx] = FColor(TexID1, TexID2, BlendFactor, 255);
       }
     }
 
-    // Apply vertex colors to component (NOTE: This requires enabling on
-    // component) For now, just log that we prepared the data Full application
-    // needs SetLODVertexColors or similar
+    // Apply vertex colors to component
+    // (NOTE: This requires enabling on
+    // component) For now, just log that
+    // we prepared the data Full
+    // application needs
+    // SetLODVertexColors or similar
     ComponentsProcessed++;
   }
 
   UE_LOG(LogRoseImporter, Log,
-         TEXT("Vertex colors prepared for %d components (application TODO)"),
+         TEXT("Vertex colors prepared "
+              "for %d components "
+              "(application TODO)"),
          ComponentsProcessed);
 }
 
@@ -928,7 +978,9 @@ void URoseImporter::CreateUnifiedLandscape(const TArray<FLoadedTile> &AllTiles,
   int32 TotalSizeX = (MaxX - MinX + 1) * 64 + 1;
   int32 TotalSizeY = (MaxY - MinY + 1) * 64 + 1;
 
-  UE_LOG(LogRoseImporter, Log, TEXT("Creating unified landscape: %dx%d"),
+  UE_LOG(LogRoseImporter, Log,
+         TEXT("Creating unified "
+              "landscape: %dx%d"),
          TotalSizeX, TotalSizeY);
 
   // STEP 1: Merge all heightmaps
@@ -950,10 +1002,12 @@ void URoseImporter::CreateUnifiedLandscape(const TArray<FLoadedTile> &AllTiles,
     }
   }
 
-  // STEP 2: Analyze TIL data to find unique texture pairs
-  // CRITICAL: Use SAME logic as CreateLandscapeMaterial to ensure layer names
-  // match!
-  TMap<int64, int32> TexturePairFrequency;
+  // STEP 2: Analyze TIL data to find
+  // unique texture IDs (Individual, not
+  // pairs) CRITICAL: Use SAME logic as
+  // CreateLandscapeMaterial to ensure
+  // layer names match!
+  TMap<int32, int32> TextureFrequency;
 
   for (const FLoadedTile &Tile : AllTiles) {
     for (const FRoseTilePatch &Patch : Tile.TIL.Patches) {
@@ -963,52 +1017,51 @@ void URoseImporter::CreateUnifiedLandscape(const TArray<FLoadedTile> &AllTiles,
         int32 TexID1 = ZON.Tiles[TileID].GetTextureID1();
         int32 TexID2 = ZON.Tiles[TileID].GetTextureID2();
 
-        // Use only TexID1 for now (matching material logic)
-        int64 Key = ((int64)TexID1 << 32) | (int64)TexID1;
-
-        int32 &Count = TexturePairFrequency.FindOrAdd(Key, 0);
-        Count++;
+        if (TexID1 >= 0)
+          TextureFrequency.FindOrAdd(TexID1)++;
+        if (TexID2 >= 0)
+          TextureFrequency.FindOrAdd(TexID2)++;
       }
     }
   }
 
-  // Sort and select top N (matching material logic)
-  struct FTexturePair {
-    int32 TexID1;
-    int32 TexID2;
+  // Sort and select top N (matching
+  // material logic)
+  struct FTextureCount {
+    int32 TexID;
     int32 Count;
   };
 
-  TArray<FTexturePair> AllPairs;
-  for (const auto &Pair : TexturePairFrequency) {
-    FTexturePair TexPair;
-    TexPair.TexID1 = (int32)(Pair.Key >> 32);
-    TexPair.TexID2 = (int32)(Pair.Key & 0xFFFFFFFF);
-    TexPair.Count = Pair.Value;
-    AllPairs.Add(TexPair);
+  TArray<FTextureCount> AllTextures;
+  for (const auto &Pair : TextureFrequency) {
+    AllTextures.Add({Pair.Key, Pair.Value});
   }
 
-  AllPairs.Sort([](const FTexturePair &A, const FTexturePair &B) {
+  AllTextures.Sort([](const FTextureCount &A, const FTextureCount &B) {
     return A.Count > B.Count;
   });
 
-  const int32 MaxLayers = 24;
-  int32 NumLayersToCreate = FMath::Min(AllPairs.Num(), MaxLayers);
+  const int32 MaxLayers = 64; // Increased to 64
+  int32 NumLayersToCreate = FMath::Min(AllTextures.Num(), MaxLayers);
 
-  TArray<FTexturePair> SelectedPairs;
+  TArray<int32> SelectedTextureIDs;
   for (int32 i = 0; i < NumLayersToCreate; ++i) {
-    SelectedPairs.Add(AllPairs[i]);
+    SelectedTextureIDs.Add(AllTextures[i].TexID);
   }
 
   UE_LOG(LogRoseImporter, Log,
-         TEXT("Found %d texture pairs, creating %d weightmaps"), AllPairs.Num(),
-         NumLayersToCreate);
+         TEXT("Found %d unique textures, "
+              "creating %d weightmaps"),
+         AllTextures.Num(), NumLayersToCreate);
 
-  // STEP 3: Generate weightmaps for selected texture pairs
-  // Map: TexID1 -> WeightData
+  // STEP 3: Generate weightmaps for
+  // selected texture pairs Map: TexID1
+  // -> WeightData STEP 3: Generate
+  // weightmaps for selected texture IDs
+  // Map: TexID -> WeightData
   TMap<int32, TArray<uint8>> WeightDataMap;
-  for (const FTexturePair &Pair : SelectedPairs) {
-    TArray<uint8> &WeightData = WeightDataMap.Add(Pair.TexID1);
+  for (int32 TexID : SelectedTextureIDs) {
+    TArray<uint8> &WeightData = WeightDataMap.Add(TexID);
     WeightData.SetNumZeroed(TotalSizeX * TotalSizeY);
   }
 
@@ -1030,29 +1083,46 @@ void URoseImporter::CreateUnifiedLandscape(const TArray<FLoadedTile> &AllTiles,
           continue;
 
         int32 TexID1 = ZON.Tiles[TileID].GetTextureID1();
+        int32 TexID2 = ZON.Tiles[TileID].GetTextureID2();
 
-        // Find if this TexID is in our selected pairs
-        TArray<uint8> *WeightData = WeightDataMap.Find(TexID1);
-
-        // If texture not in top 12, assign to first layer (base) to avoid black
-        // squares
-        if (!WeightData && SelectedPairs.Num() > 0) {
-          WeightData = WeightDataMap.Find(SelectedPairs[0].TexID1);
+        // Check ID1
+        if (TArray<uint8> *WeightData1 = WeightDataMap.Find(TexID1)) {
+          // Upsample this patch to 4x4
+          // weightmap pixels
+          for (int32 dy = 0; dy < 4; ++dy) {
+            for (int32 dx = 0; dx < 4; ++dx) {
+              int32 DestIdx = (OffsetY + py * 4 + dy) * TotalSizeX +
+                              (OffsetX + px * 4 + dx);
+              if (WeightData1->IsValidIndex(DestIdx))
+                (*WeightData1)[DestIdx] = 255;
+            }
+          }
+        } else if (SelectedTextureIDs.Num() > 0) {
+          // Fallback to Base Layer if
+          // ID1 not found (Valid for ID1
+          // only)
+          if (TArray<uint8> *BaseData =
+                  WeightDataMap.Find(SelectedTextureIDs[0])) {
+            for (int32 dy = 0; dy < 4; ++dy) {
+              for (int32 dx = 0; dx < 4; ++dx) {
+                int32 DestIdx = (OffsetY + py * 4 + dy) * TotalSizeX +
+                                (OffsetX + px * 4 + dx);
+                if (BaseData->IsValidIndex(DestIdx))
+                  (*BaseData)[DestIdx] = 255;
+              }
+            }
+          }
         }
 
-        if (!WeightData)
-          continue;
-
-        // Upsample this patch to 4x4 weightmap pixels
-        for (int32 dy = 0; dy < 4; ++dy) {
-          for (int32 dx = 0; dx < 4; ++dx) {
-            int32 DestX = OffsetX + px * 4 + dx;
-            int32 DestY = OffsetY + py * 4 + dy;
-            int32 DestIdx = DestY * TotalSizeX + DestX;
-
-            if (DestIdx >= 0 && DestIdx < WeightData->Num()) {
-              if (DestIdx >= 0 && DestIdx < WeightData->Num()) {
-                (*WeightData)[DestIdx] = 255;
+        // Check ID2 (Overlay)
+        if (TexID2 >= 0) {
+          if (TArray<uint8> *WeightData2 = WeightDataMap.Find(TexID2)) {
+            for (int32 dy = 0; dy < 4; ++dy) {
+              for (int32 dx = 0; dx < 4; ++dx) {
+                int32 DestIdx = (OffsetY + py * 4 + dy) * TotalSizeX +
+                                (OffsetX + px * 4 + dx);
+                if (WeightData2->IsValidIndex(DestIdx))
+                  (*WeightData2)[DestIdx] = 255;
               }
             }
           }
@@ -1061,13 +1131,16 @@ void URoseImporter::CreateUnifiedLandscape(const TArray<FLoadedTile> &AllTiles,
     }
   }
 
-  // STEP 4: Create landscape layers for selected texture pairs
+  // STEP 4: Create landscape layers for
+  // selected textures
   TArray<FLandscapeImportLayerInfo> LayerInfos;
 
-  for (const FTexturePair &Pair : SelectedPairs) {
-    // Use same naming as material: "T{TexID1}"
-    FString LayerName = FString::Printf(TEXT("T%d"), Pair.TexID1);
-    FString PackageName = TEXT("/Game/Rose/Imported/Landscape/Layers");
+  for (int32 TexID : SelectedTextureIDs) {
+    // Use same naming as material:
+    // "T{TexID}"
+    FString LayerName = FString::Printf(TEXT("T%d"), TexID);
+    FString PackageName = TEXT("/Game/Rose/Imported/"
+                               "Landscape/Layers");
     FString AssetName = LayerName;
 
     UPackage *Package = CreatePackage(*(PackageName / AssetName));
@@ -1082,19 +1155,23 @@ void URoseImporter::CreateUnifiedLandscape(const TArray<FLoadedTile> &AllTiles,
       FLandscapeImportLayerInfo LayerInfo;
       LayerInfo.LayerName = FName(*LayerName);
       LayerInfo.LayerInfo = LIO;
-      LayerInfo.LayerData = WeightDataMap[Pair.TexID1];
+      LayerInfo.LayerData = WeightDataMap[TexID];
       LayerInfos.Add(LayerInfo);
 
       UE_LOG(LogRoseImporter, Log, TEXT("Created layer: %s"), *LayerName);
     }
   }
 
-  // STEP 5: Spawn landscape at correct global position
-  // Reference formula: (tileIndex - 32) * 16000 - 8000
-  // Tile 32 is ROSE world origin. -8000 compensates for UE landscape pivot.
+  // STEP 5: Spawn landscape at correct
+  // global position Reference formula:
+  // (tileIndex - 32) * 16000 - 8000 Tile
+  // 32 is ROSE world origin. -8000
+  // compensates for UE landscape pivot.
   FVector LandscapeLocation((MinX - 32) * 16000.0f - 8000.0f,
                             (MinY - 32) * 16000.0f - 8000.0f, 0.0f);
-  UE_LOG(LogRoseImporter, Log, TEXT("Landscape at: %s (MinX=%d MinY=%d)"),
+  UE_LOG(LogRoseImporter, Log,
+         TEXT("Landscape at: %s "
+              "(MinX=%d MinY=%d)"),
          *LandscapeLocation.ToString(), MinX, MinY);
 
   ALandscape *Landscape =
@@ -1104,19 +1181,25 @@ void URoseImporter::CreateUnifiedLandscape(const TArray<FLoadedTile> &AllTiles,
     Landscape->SetActorLabel(TEXT("RoseZone_UnifiedLandscape"));
     Landscape->SetActorScale3D(FVector(250.0f, 250.0f, 100.0f));
 
-    // STEP 5: Create and assign 12-layer weightmap material
+    // STEP 5: Create and assign 12-layer
+    // weightmap material
     UE_LOG(LogRoseImporter, Log,
-           TEXT("Creating 12-layer landscape material..."));
+           TEXT("Creating 12-layer "
+                "landscape material..."));
 
     UMaterial *LandscapeMaterial = CreateLandscapeMaterial(ZON, AllTiles);
 
     if (LandscapeMaterial) {
       Landscape->LandscapeMaterial = LandscapeMaterial;
       UE_LOG(LogRoseImporter, Log,
-             TEXT("Assigned 12-layer weightmap material to landscape"));
+             TEXT("Assigned 12-layer "
+                  "weightmap material "
+                  "to landscape"));
     } else {
       UE_LOG(LogRoseImporter, Warning,
-             TEXT("Failed to create landscape material, using fallback"));
+             TEXT("Failed to create "
+                  "landscape material, "
+                  "using fallback"));
       EnsureMasterMaterial();
       if (MasterMaterial) {
         Landscape->LandscapeMaterial = MasterMaterial;
@@ -1129,23 +1212,154 @@ void URoseImporter::CreateUnifiedLandscape(const TArray<FLoadedTile> &AllTiles,
     HeightDataMap.Add(FGuid(), MergedHeights);
     MaterialLayerInfoMap.Add(FGuid(), LayerInfos);
 
+    // FIX: Revert to nullptr (Import
+    // takes a filename string, not a
+    // material object)
     Landscape->Import(FGuid::NewGuid(), 0, 0, TotalSizeX - 1, TotalSizeY - 1, 1,
-                      63, // ComponentsPerSection, SectionsPerComponent
+                      63, // ComponentsPerSection,
+                          // SectionsPerComponent
                       HeightDataMap, nullptr, MaterialLayerInfoMap,
                       ELandscapeImportAlphamapType::Additive,
                       TArrayView<const FLandscapeLayer>());
 
+    // CRITICAL: Assign material AFTER
+    // import, as Import() might reset
+    // the actor state
+    if (LandscapeMaterial) {
+      Landscape->LandscapeMaterial = LandscapeMaterial;
+      Landscape->PostEditChange();
+      UE_LOG(LogRoseImporter, Log,
+             TEXT("Assigned Landscape "
+                  "Material (Post-Import)"));
+    } else if (MasterMaterial) {
+      Landscape->LandscapeMaterial = MasterMaterial;
+      Landscape->PostEditChange();
+    }
+
+    // STEP 6: Assign Per-Component
+    // Material Instances for Atlas UVs
     UE_LOG(LogRoseImporter, Log,
-           TEXT("Unified landscape created successfully!"));
+           TEXT("Assigning Per-Component "
+                "Atlas Data..."));
+
+    TArray<ULandscapeComponent *> Components;
+    Landscape->GetComponents(Components);
+
+    // Creates a lookup map for tiles
+    TMap<FIntPoint, const FLoadedTile *> TileMap;
+    for (const FLoadedTile &Tile : AllTiles) {
+      TileMap.Add(FIntPoint(Tile.X, Tile.Y), &Tile);
+    }
+
+    for (ULandscapeComponent *Comp : Components) {
+      if (!Comp)
+        continue;
+
+      // Calculate Tile Coordinates from
+      // Component Base Landscape
+      // imported at 0,0 relative to
+      // Actor?
+      // Component->GetSectionBase()
+      // returns coordinates in Landscape
+      // Quads 1 Tile = 64x64 Quads
+      // (65x65 Vertices). If
+      // ComponentsPerSection=1 and
+      // SectionsPerComponent=1 (63x63
+      // quads in import args?) Wait,
+      // Import args used: 1, 63. 63
+      // quads per component. ROSE tiles
+      // are 64 quads (65 vertices).
+      // Overlap of 1 vertex. So
+      // component 0 is at 0..63.
+      // Component 1 is at 64..127?
+      // SectionBase should return
+      // integer coords.
+
+      FIntPoint SectionBase = Comp->GetSectionBase();
+      int32 CompX = SectionBase.X; // in Quads
+      int32 CompY = SectionBase.Y;
+
+      // ROSE tiles are 64 units wide.
+      // Tile X index = MinX + (CompX /
+      // 64).
+      int32 TileX = MinX + (CompX / 64);
+      int32 TileY = MinY + (CompY / 64);
+
+      const FLoadedTile *Tile = TileMap.FindRef(FIntPoint(TileX, TileY));
+
+      /* DISABLE MICs FOR DEBUGGING -
+      Validate Base Material First if
+      (Tile) {
+        // Generate TileMapData (Reuse
+      existing function)
+        // Use format Tile_X_Y
+        FString TileName =
+      FString::Printf(TEXT("%d_%d"),
+      TileX, TileY);
+
+        // Create Data Texture
+        UTexture2D *TileMapData =
+            CreateTileMapDataTexture(Tile->TIL,
+      ZON, TileName);
+
+        if (TileMapData &&
+      Landscape->LandscapeMaterial) {
+          // Create MIC
+          FString MICName =
+              FString::Printf(TEXT("MIC_Landscape_%s"),
+      *TileName); FString MICPackageName
+      =
+              TEXT("/Game/Rose/Imported/Materials/Instances/")
+      + MICName;
+
+          UPackage *MICPackage =
+      CreatePackage(*MICPackageName);
+          UMaterialInstanceConstantFactoryNew
+      *Factory =
+              NewObject<UMaterialInstanceConstantFactoryNew>();
+          Factory->InitialParent =
+      Landscape->LandscapeMaterial;
+
+          UMaterialInstanceConstant *MIC
+      = (UMaterialInstanceConstant
+      *)Factory->FactoryCreateNew(
+                  UMaterialInstanceConstant::StaticClass(),
+      MICPackage, *MICName, RF_Standalone
+      | RF_Public, nullptr, GWarn);
+
+          if (MIC) {
+            // Set Parameter
+            MIC->SetTextureParameterValueEditorOnly(FName("TileMapData"),
+                                                    TileMapData);
+
+            MIC->PreEditChange(nullptr);
+            MIC->PostEditChange();
+            MIC->MarkPackageDirty();
+            FAssetRegistryModule::AssetCreated(MIC);
+
+            // Assign to Component
+            Comp->OverrideMaterial = MIC;
+            Comp->UpdateMaterialInstances();
+          }
+        }
+      }
+      */
+    }
+
+    UE_LOG(LogRoseImporter, Log,
+           TEXT("Unified landscape created "
+                "successfully!"));
   }
 }
 
-// Helper to create a material with layers for a single tile
+// Helper to create a material with
+// layers for a single tile
 UMaterial *URoseImporter::CreateTileMaterial(const FRoseTIL &TIL,
                                              const FRoseZON &ZON,
                                              const FString &TileName,
                                              TArray<int32> &OutTextureIDs) {
-  // 1. Analyze TIL data to find unique textures
+  // 1. Analyze TIL data to find unique
+  // textures
   TMap<int32, int32> TextureCounts;
   for (const FRoseTilePatch &Patch : TIL.Patches) {
     int32 TileID = Patch.Tile;
@@ -1170,7 +1384,8 @@ UMaterial *URoseImporter::CreateTileMaterial(const FRoseTIL &TIL,
     return A.Count > B.Count;
   });
 
-  // Limit to 16 layers (shader sampler limit)
+  // Limit to 16 layers (shader sampler
+  // limit)
   const int32 MaxLayers = 16;
   int32 NumLayers = FMath::Min(TextureList.Num(), MaxLayers);
 
@@ -1179,13 +1394,16 @@ UMaterial *URoseImporter::CreateTileMaterial(const FRoseTIL &TIL,
     OutTextureIDs.Add(TextureList[i].TexID);
   }
 
-  // If no textures found, return nullptr (will fallback to master material)
+  // If no textures found, return nullptr
+  // (will fallback to master material)
   if (NumLayers == 0)
     return nullptr;
 
   // 3. Create Material
   FString MaterialName = TEXT("M_Landscape_") + TileName;
-  FString PName = TEXT("/Game/Rose/Imported/Materials/") + MaterialName;
+  FString PName = TEXT("/Game/Rose/Imported/"
+                       "Materials/") +
+                  MaterialName;
 
   UPackage *Package = CreatePackage(*PName);
   UMaterialFactoryNew *Factory = NewObject<UMaterialFactoryNew>();
@@ -1193,12 +1411,116 @@ UMaterial *URoseImporter::CreateTileMaterial(const FRoseTIL &TIL,
       UMaterial::StaticClass(), Package, *MaterialName,
       RF_Public | RF_Standalone, nullptr, GWarn);
 
-  // 4. Create LandscapeLayerBlend
+  // 3b. Create TileMap Data Texture
+  // (Atlas Offsets)
+  UTexture2D *TileMapData =
+      CreateTileMapDataTexture(TIL, ZON,
+                               TileName); // Pass TileName for
+                                          // persistence
+
+  // 4. Build UV Graph (Atlas Logic)
+  // Base Coords (0..1 per Component = 16
+  // patches)
+  UMaterialExpressionLandscapeLayerCoords *UVs =
+      NewObject<UMaterialExpressionLandscapeLayerCoords>(Material);
+  Material->GetExpressionCollection().AddExpression(UVs);
+  UVs->MaterialExpressionEditorX = -1200;
+  UVs->MaterialExpressionEditorY = 0;
+  UVs->MappingScale = 1.0f;
+  UVs->MappingType = TCMT_Auto;
+
+  // Frac(Coords * 16) -> LocalUV (0..1
+  // per Patch)
+  UMaterialExpressionConstant *Const16 =
+      NewObject<UMaterialExpressionConstant>(Material);
+  Const16->R = 16.0f;
+  Material->GetExpressionCollection().AddExpression(Const16);
+  Const16->MaterialExpressionEditorX = -1100;
+
+  UMaterialExpressionMultiply *Mul16 =
+      NewObject<UMaterialExpressionMultiply>(Material);
+  Mul16->A.Expression = UVs;
+  Mul16->B.Expression = Const16;
+  Material->GetExpressionCollection().AddExpression(Mul16);
+  Mul16->MaterialExpressionEditorX = -1000;
+
+  UMaterialExpressionFrac *LocalUV =
+      NewObject<UMaterialExpressionFrac>(Material);
+  LocalUV->Input.Expression = Mul16;
+  Material->GetExpressionCollection().AddExpression(LocalUV);
+  LocalUV->MaterialExpressionEditorX = -900;
+
+  // Sample Data Texture
+  UMaterialExpressionTextureSample *DataSample =
+      NewObject<UMaterialExpressionTextureSample>(Material);
+  DataSample->Texture = TileMapData;
+  DataSample->SamplerType = SAMPLERTYPE_LinearColor;
+  DataSample->Coordinates.Expression = UVs; // Coords 0..1 maps perfectly
+                                            // to 16x16 pixels
+  Material->GetExpressionCollection().AddExpression(DataSample);
+  DataSample->MaterialExpressionEditorX = -900;
+  DataSample->MaterialExpressionEditorY = 200;
+
+  // ScaledLocal = LocalUV * 0.25
+  UMaterialExpressionConstant *Const025 =
+      NewObject<UMaterialExpressionConstant>(Material);
+  Const025->R = 0.25f;
+  Material->GetExpressionCollection().AddExpression(Const025);
+  Const025->MaterialExpressionEditorX = -800;
+
+  UMaterialExpressionMultiply *ScaledLocal =
+      NewObject<UMaterialExpressionMultiply>(Material);
+  ScaledLocal->A.Expression = LocalUV;
+  ScaledLocal->B.Expression = Const025;
+  Material->GetExpressionCollection().AddExpression(ScaledLocal);
+  ScaledLocal->MaterialExpressionEditorX = -700;
+
+  // Offset = Data.RG
+  UMaterialExpressionComponentMask *MaskRG =
+      NewObject<UMaterialExpressionComponentMask>(Material);
+  MaskRG->Input.Expression = DataSample;
+  MaskRG->R = 1;
+  MaskRG->G = 1;
+  MaskRG->B = 0;
+  MaskRG->A = 0;
+  Material->GetExpressionCollection().AddExpression(MaskRG);
+  MaskRG->MaterialExpressionEditorX = -700;
+  MaskRG->MaterialExpressionEditorY = 200;
+
+  // AtlasUV = ScaledLocal + Offset
+  UMaterialExpressionAdd *AtlasUV = NewObject<UMaterialExpressionAdd>(Material);
+  AtlasUV->A.Expression = ScaledLocal;
+  AtlasUV->B.Expression = MaskRG;
+  Material->GetExpressionCollection().AddExpression(AtlasUV);
+  AtlasUV->MaterialExpressionEditorX = -600;
+
+  // Lerp Alpha (Data.A)
+  UMaterialExpressionComponentMask *MaskA =
+      NewObject<UMaterialExpressionComponentMask>(Material);
+  MaskA->Input.Expression = DataSample;
+  MaskA->R = 0;
+  MaskA->G = 0;
+  MaskA->B = 0;
+  MaskA->A = 1;
+  Material->GetExpressionCollection().AddExpression(MaskA);
+  MaskA->MaterialExpressionEditorX = -700;
+  MaskA->MaterialExpressionEditorY = 300;
+
+  // FinalUV = Lerp(AtlasUV, LocalUV,
+  // MaskA) If A=0 (Atlas) -> AtlasUV. If
+  // A=1 (Full) -> LocalUV.
+  UMaterialExpressionLinearInterpolate *FinalUV =
+      NewObject<UMaterialExpressionLinearInterpolate>(Material);
+  FinalUV->A.Expression = AtlasUV;
+  FinalUV->B.Expression = LocalUV;
+  FinalUV->Alpha.Expression = MaskA;
+  Material->GetExpressionCollection().AddExpression(FinalUV);
+  FinalUV->MaterialExpressionEditorX = -500;
+
+  // 5. Create LandscapeLayerBlend
   UMaterialExpressionLandscapeLayerBlend *LayerBlend =
       NewObject<UMaterialExpressionLandscapeLayerBlend>(Material);
   Material->GetExpressionCollection().AddExpression(LayerBlend);
-  LayerBlend->MaterialExpressionEditorX = -200;
-  LayerBlend->MaterialExpressionEditorY = 0;
 
   int32 YOffset = 0;
   for (int32 i = 0; i < NumLayers; ++i) {
@@ -1208,7 +1530,8 @@ UMaterial *URoseImporter::CreateTileMaterial(const FRoseTIL &TIL,
     FLayerBlendInput &Layer = LayerBlend->Layers.AddDefaulted_GetRef();
     Layer.LayerName = FName(*FString::Printf(TEXT("T%d"), TexID));
 
-    // First layer is AlphaBlend with gray fallback, others WeightBlend
+    // First layer is AlphaBlend with
+    // gray fallback, others WeightBlend
     if (i == 0) {
       Layer.BlendType = LB_AlphaBlend;
       Layer.ConstLayerInput = FVector(0.5f, 0.5f, 0.5f);
@@ -1221,7 +1544,7 @@ UMaterial *URoseImporter::CreateTileMaterial(const FRoseTIL &TIL,
     UMaterialExpressionTextureSampleParameter2D *Sampler =
         NewObject<UMaterialExpressionTextureSampleParameter2D>(Material);
     Material->GetExpressionCollection().AddExpression(Sampler);
-    Sampler->MaterialExpressionEditorX = -600;
+    Sampler->MaterialExpressionEditorX = -300; // Moved closer
     Sampler->MaterialExpressionEditorY = YOffset;
     Sampler->ParameterName = FName(*FString::Printf(TEXT("Tex_T%d"), TexID));
 
@@ -1230,16 +1553,8 @@ UMaterial *URoseImporter::CreateTileMaterial(const FRoseTIL &TIL,
       Sampler->Texture = LoadRoseTexture(ZON.Textures[TexID]);
     }
 
-    // Create UV Coords
-    UMaterialExpressionLandscapeLayerCoords *UVs =
-        NewObject<UMaterialExpressionLandscapeLayerCoords>(Material);
-    Material->GetExpressionCollection().AddExpression(UVs);
-    UVs->MaterialExpressionEditorX = -800;
-    UVs->MaterialExpressionEditorY = YOffset;
-    UVs->MappingScale = 1.0f;
-    UVs->MappingType = TCMT_Auto;
-
-    Sampler->Coordinates.Expression = UVs;
+    // Use FinalUV
+    Sampler->Coordinates.Expression = FinalUV;
     Layer.LayerInput.Expression = Sampler;
 
     YOffset += 250;
@@ -1269,7 +1584,8 @@ URoseImporter::GenerateTileWeightmaps(const FRoseTIL &TIL, const FRoseZON &ZON,
     Map.SetNumZeroed(64 * 64);
   }
 
-  // Fill weightmaps from 16x16 patch grid
+  // Fill weightmaps from 16x16 patch
+  // grid
   for (int32 py = 0; py < 16; ++py) {
     for (int32 px = 0; px < 16; ++px) {
       int32 PatchIdx = py * 16 + px;
@@ -1289,20 +1605,36 @@ URoseImporter::GenerateTileWeightmaps(const FRoseTIL &TIL, const FRoseZON &ZON,
       // Find matching weightmap
       TArray<uint8> *Map = Weightmaps.Find(TexID);
 
-      // If texture not in selected list, fallback to first layer (if
+      // If texture not in selected list,
+      // fallback to first layer (if
       // available)
       if (!Map && TextureIDs.Num() > 0) {
         Map = Weightmaps.Find(TextureIDs[0]);
       }
 
+      // Write TexID1
       if (Map) {
-        // Upsample 1 patch -> 4x4 weightmap pixels
         for (int32 dy = 0; dy < 4; ++dy) {
           for (int32 dx = 0; dx < 4; ++dx) {
             int32 wy = py * 4 + dy;
             int32 wx = px * 4 + dx;
-            if (wy < 64 && wx < 64) {
+            if (wy < 64 && wx < 64)
               (*Map)[wy * 64 + wx] = 255;
+          }
+        }
+      }
+
+      // Write TexID2 (Secondary Texture)
+      int32 TexID2 = ZON.Tiles[TileID].GetTextureID2();
+      if (TexID2 >= 0) {
+        TArray<uint8> *Map2 = Weightmaps.Find(TexID2);
+        if (Map2) {
+          for (int32 dy = 0; dy < 4; ++dy) {
+            for (int32 dx = 0; dx < 4; ++dx) {
+              int32 wy = py * 4 + dy;
+              int32 wx = px * 4 + dx;
+              if (wy < 64 && wx < 64)
+                (*Map2)[wy * 64 + wx] = 255;
             }
           }
         }
@@ -1318,6 +1650,18 @@ URoseImporter::GenerateTileWeightmaps(const FRoseTIL &TIL, const FRoseZON &ZON,
     }
     UE_LOG(LogRoseImporter, Log, TEXT("Tile Rotation Stats: %s"), *RotStats);
   }
+
+  // LOG WEIGHTMAP USAGE
+  FString WMLog = TEXT("Weightmap Usage: ");
+  for (const auto &Pair : Weightmaps) {
+    int32 Count = 0;
+    for (uint8 Val : Pair.Value) {
+      if (Val > 0)
+        Count++;
+    }
+    WMLog += FString::Printf(TEXT("T%d(%d px) "), Pair.Key, Count);
+  }
+  UE_LOG(LogRoseImporter, Log, TEXT("%s"), *WMLog);
 
   return Weightmaps;
 }
@@ -1336,20 +1680,28 @@ void URoseImporter::ProcessHeightmap(const FRoseHIM &HIM, const FRoseTIL &TIL,
       World->SpawnActor<ALandscape>(Offset, FRotator::ZeroRotator);
   if (Lansc) {
     Lansc->SetActorLabel(FString::Printf(TEXT("Landscape_%s"), *Base));
-    // Correct Scale: 16000cm / 64 intervals = 250.0cm per interval
-    // ROSE Heightmap is 65x65 vertices (64 intervals).
-    // Unreal Component (63 quads) has 64x64 vertices.
-    // We map 0..63 of ROSE directly to 0..63 of Unreal.
-    // The 64th ROSE vertex is the start of the next tile (overlap).
+    // Correct Scale: 16000cm / 64
+    // intervals = 250.0cm per interval
+    // ROSE Heightmap is 65x65 vertices
+    // (64 intervals). Unreal Component
+    // (63 quads) has 64x64 vertices. We
+    // map 0..63 of ROSE directly to
+    // 0..63 of Unreal. The 64th ROSE
+    // vertex is the start of the next
+    // tile (overlap).
     Lansc->SetActorScale3D(FVector(250.0f, 250.0f, 100.0f));
 
-    // 1. Create Multilayer Material for this tile
+    // 1. Create Multilayer Material for
+    // this tile
     TArray<int32> TextureIDs;
     UMaterial *TileMaterial = CreateTileMaterial(TIL, ZON, Base, TextureIDs);
 
     if (!TileMaterial) {
       UE_LOG(LogRoseImporter, Warning,
-             TEXT("Tile %s: Could not create material, skipping"), *Base);
+             TEXT("Tile %s: Could not "
+                  "create material, "
+                  "skipping"),
+             *Base);
       Lansc->Destroy();
       return;
     }
@@ -1364,8 +1716,9 @@ void URoseImporter::ProcessHeightmap(const FRoseHIM &HIM, const FRoseTIL &TIL,
     TArray<uint16> HD;
     HD.SetNumUninitialized(64 * 64);
 
-    // Direct Mapping (No Resampling) - Use Scale 250
-    // We take the first 64x64 vertices from the 65x65 HIM
+    // Direct Mapping (No Resampling) -
+    // Use Scale 250 We take the first
+    // 64x64 vertices from the 65x65 HIM
     for (int y = 0; y < 64; ++y) {
       for (int x = 0; x < 64; ++x) {
         // Direct lookup (1:1)
@@ -1388,7 +1741,9 @@ void URoseImporter::ProcessHeightmap(const FRoseHIM &HIM, const FRoseTIL &TIL,
     TArray<FLandscapeImportLayerInfo> LayerInfos;
 
     for (int32 TexID : TextureIDs) {
-      FString LayerName = FString::Printf(TEXT("Layer_T%d"), TexID);
+      // FIX: Name must match Material
+      // Layer Name ("T<ID>")
+      FString LayerName = FString::Printf(TEXT("T%d"), TexID);
 
       ULandscapeLayerInfoObject *LayerInfo =
           NewObject<ULandscapeLayerInfoObject>();
@@ -1414,8 +1769,9 @@ void URoseImporter::ProcessHeightmap(const FRoseHIM &HIM, const FRoseTIL &TIL,
                   TArrayView<const FLandscapeLayer>());
 
     UE_LOG(LogRoseImporter, Log,
-           TEXT("Tile %s: Created landscape with %d layers"), *Base,
-           TextureIDs.Num());
+           TEXT("Tile %s: Created "
+                "landscape with %d layers"),
+           *Base, TextureIDs.Num());
   }
 }
 
@@ -1426,12 +1782,14 @@ void URoseImporter::ProcessObjects(const FRoseIFO &IFO, UWorld *World,
   if (!ZoneObjectsActor)
     return;
 
-  // Helper lambda to process a list of objects vs a specific ZSC
+  // Helper lambda to process a list of
+  // objects vs a specific ZSC
   auto ProcessList = [&, this](const TArray<FRoseMapObject> &MapObjects,
                                FRoseZSC &ZSC, const FString &DebugCtx) {
     if (!ZoneObjectsActor) {
       UE_LOG(LogRoseImporter, Error,
-             TEXT("ZoneObjectsActor is null in ProcessObjects!"));
+             TEXT("ZoneObjectsActor is null "
+                  "in ProcessObjects!"));
       return;
     }
 
@@ -1469,7 +1827,8 @@ void URoseImporter::ProcessObjects(const FRoseIFO &IFO, UWorld *World,
           continue;
         }
 
-        // Skip meshes with invalid bounds
+        // Skip meshes with invalid
+        // bounds
         if (Mesh->GetBoundingBox().GetExtent().ContainsNaN()) {
           continue;
         }
@@ -1491,7 +1850,8 @@ void URoseImporter::ProcessObjects(const FRoseIFO &IFO, UWorld *World,
           continue;
         }
 
-        // Animated parts get individual actors; static parts use HISM
+        // Animated parts get individual
+        // actors; static parts use HISM
         if (!Part.AnimPath.IsEmpty()) {
           SpawnAnimatedObject(Mesh, FinalTransform, Part.AnimPath, World);
           AnimCount++;
@@ -1507,7 +1867,21 @@ void URoseImporter::ProcessObjects(const FRoseIFO &IFO, UWorld *World,
             HISM->SetStaticMesh(Mesh);
             HISM->SetMobility(EComponentMobility::Static);
 
-            // [Collision Fix] Disable collision for "grass"
+            // [Shadow Fix] Always cast
+            // two-sided shadows to
+            // handle inconsistent face
+            // normals in source data
+            HISM->bCastShadowAsTwoSided = true;
+
+            // Disable shadow casting for
+            // translucent objects
+            if (MatEntry && MatEntry->AlphaEnabled &&
+                MatEntry->BlendType != 0 && MatEntry->AlphaTest == 0) {
+              HISM->SetCastShadow(false);
+            }
+
+            // [Collision Fix] Disable
+            // collision for "grass"
             if (Mesh->GetName().Contains(TEXT("grass"),
                                          ESearchCase::IgnoreCase) ||
                 MeshPath.Contains(TEXT("grass"), ESearchCase::IgnoreCase)) {
@@ -1524,7 +1898,9 @@ void URoseImporter::ProcessObjects(const FRoseIFO &IFO, UWorld *World,
       }
     }
     UE_LOG(LogRoseImporter, Log,
-           TEXT("[%s] Spawned %d instances (%d animated) from %d entries"),
+           TEXT("[%s] Spawned %d instances "
+                "(%d animated) from %d "
+                "entries"),
            *DebugCtx, SpawnCount, AnimCount, MapObjects.Num());
   };
 
@@ -1535,17 +1911,26 @@ void URoseImporter::ProcessObjects(const FRoseIFO &IFO, UWorld *World,
   ProcessList(IFO.Buildings, CnstZSC, TEXT("Cnst"));
 
   // Process Animations (Flags, etc.)
-  // Use the dynamically discovered AnimZSC (or fallback to DecoZSC if empty)
+  // Use the dynamically discovered
+  // AnimZSC (or fallback to DecoZSC if
+  // empty)
   if (AnimZSC.Meshes.Num() > 0 || AnimZSC.Objects.Num() > 0) {
     ProcessList(IFO.Animations, AnimZSC, TEXT("AnimObj"));
   } else {
     UE_LOG(LogRoseImporter, Warning,
-           TEXT("No AnimZSC found, trying DecoZSC for Animations (might be "
+           TEXT("No AnimZSC found, "
+                "trying DecoZSC for "
+                "Animations (might be "
                 "wrong objects)"));
-    // Only fallback if really desperate, but user reported
-    // trees-instead-of-flags, so fallback is bad. But better than nothing? No,
-    // trees are worse. Let's NOT fallback to DecoZSC to avoid "Tree Flags".
-    // ProcessList(IFO.Animations, DecoZSC, TEXT("AnimObj"));
+    // Only fallback if really desperate,
+    // but user reported
+    // trees-instead-of-flags, so
+    // fallback is bad. But better than
+    // nothing? No, trees are worse.
+    // Let's NOT fallback to DecoZSC to
+    // avoid "Tree Flags".
+    // ProcessList(IFO.Animations,
+    // DecoZSC, TEXT("AnimObj"));
   }
 }
 
@@ -1557,14 +1942,17 @@ void URoseImporter::SpawnAnimatedObject(UStaticMesh *Mesh,
     return;
 
   // Load the ZMO animation
-  // AnimPath from ZSC already contains the relative path (e.g. "3Ddata/...")
+  // AnimPath from ZSC already contains
+  // the relative path (e.g.
+  // "3Ddata/...")
   FString FullAnimPath = FPaths::Combine(RoseRootPath, AnimPath);
   FullAnimPath.ReplaceInline(TEXT("\\"), TEXT("/"));
 
   FRoseZMO ZMO;
   if (!ZMO.Load(FullAnimPath)) {
     UE_LOG(LogRoseImporter, Warning,
-           TEXT("[Anim] Failed to load ZMO: %s - spawning static"),
+           TEXT("[Anim] Failed to load ZMO: "
+                "%s - spawning static"),
            *FullAnimPath);
     // Fall back to static placement
     if (ZoneObjectsActor) {
@@ -1586,7 +1974,9 @@ void URoseImporter::SpawnAnimatedObject(UStaticMesh *Mesh,
 
   if (ZMO.FrameCount <= 0 || ZMO.FPS <= 0) {
     UE_LOG(LogRoseImporter, Warning,
-           TEXT("[Anim] ZMO has no frames or invalid FPS: %s"), *AnimPath);
+           TEXT("[Anim] ZMO has no frames "
+                "or invalid FPS: %s"),
+           *AnimPath);
     return;
   }
 
@@ -1609,7 +1999,8 @@ void URoseImporter::SpawnAnimatedObject(UStaticMesh *Mesh,
   Root->RegisterComponent();
   Root->SetWorldTransform(Transform);
 
-  // Add mesh component (animation drives its relative transform)
+  // Add mesh component (animation drives
+  // its relative transform)
   UStaticMeshComponent *MeshComp =
       NewObject<UStaticMeshComponent>(Actor, TEXT("AnimMesh"));
   MeshComp->SetStaticMesh(Mesh);
@@ -1618,7 +2009,8 @@ void URoseImporter::SpawnAnimatedObject(UStaticMesh *Mesh,
                               FAttachmentTransformRules::KeepRelativeTransform);
   MeshComp->RegisterComponent();
 
-  // Create animation component (tick-based, applies ZMO keyframes)
+  // Create animation component
+  // (tick-based, applies ZMO keyframes)
   URoseAnimComponent *AnimComp =
       NewObject<URoseAnimComponent>(Actor, TEXT("AnimDriver"));
   AnimComp->FPS = ZMO.FPS;
@@ -1628,8 +2020,10 @@ void URoseImporter::SpawnAnimatedObject(UStaticMesh *Mesh,
 
   // Copy channel data into the component
   for (const FRoseAnimChannel &Chan : ZMO.Channels) {
-    // FIX: Only apply animation for the Root Bone (0).
-    // Child bones/dummies should not drive the entire mesh transform.
+    // FIX: Only apply animation for the
+    // Root Bone (0). Child bones/dummies
+    // should not drive the entire mesh
+    // transform.
     if (Chan.BoneID != 0)
       continue;
 
@@ -1645,7 +2039,9 @@ void URoseImporter::SpawnAnimatedObject(UStaticMesh *Mesh,
   AnimComp->RegisterComponent();
 
   UE_LOG(LogRoseImporter, Log,
-         TEXT("[Anim] Spawned: %s (%d frames @ %d FPS, Pos:%d Rot:%d Scl:%d)"),
+         TEXT("[Anim] Spawned: %s (%d "
+              "frames @ %d FPS, Pos:%d "
+              "Rot:%d Scl:%d)"),
          *AnimPath, ZMO.FrameCount, ZMO.FPS, AnimComp->PosKeys.Num(),
          AnimComp->RotKeys.Num(), AnimComp->ScaleKeys.Num());
 }
@@ -1662,29 +2058,36 @@ void URoseImporter::EnsureMasterMaterial() {
     // If not found, create it
     if (!MatPtr) {
       UE_LOG(LogRoseImporter, Log,
-             TEXT("[Material] Creating new master material: %s"), *Name);
+             TEXT("[Material] Creating new "
+                  "master material: %s"),
+             *Name);
       UPackage *P = CreatePackage(*PN);
       MatPtr = (UMaterial *)NewObject<UMaterialFactoryNew>()->FactoryCreateNew(
           UMaterial::StaticClass(), P, *Name, RF_Public | RF_Standalone,
           nullptr, GWarn);
       bNeedsBuild = true;
     } else {
-      // Only rebuild if empty (check if expressions exist)
+      // Only rebuild if empty (check if
+      // expressions exist)
       if (MatPtr->GetExpressionCollection().Expressions.Num() == 0) {
         bNeedsBuild = true;
       }
     }
 
-    // Only update content if needed (Prevents constant Saving/Rebuilding)
+    // Only update content if needed
+    // (Prevents constant
+    // Saving/Rebuilding)
     if (MatPtr && bNeedsBuild) {
-      // Clear existing expressions to rebuild clean
+      // Clear existing expressions to
+      // rebuild clean
       MatPtr->GetExpressionCollection().Empty();
 
       auto BT = NewObject<UMaterialExpressionTextureSampleParameter2D>(MatPtr);
       BT->ParameterName = TEXT("BaseTexture");
       MatPtr->GetExpressionCollection().AddExpression(BT);
 
-      // Create Tint Color Parameter (Default White)
+      // Create Tint Color Parameter
+      // (Default White)
       auto TintColor = NewObject<UMaterialExpressionVectorParameter>(MatPtr);
       TintColor->ParameterName = TEXT("TintColor");
       TintColor->DefaultValue = FLinearColor::White;
@@ -1700,7 +2103,8 @@ void URoseImporter::EnsureMasterMaterial() {
       MatPtr->GetEditorOnlyData()->BaseColor.Expression = Mult;
       MatPtr->GetEditorOnlyData()->BaseColor.OutputIndex = 0;
 
-      // Connect Alpha (Source is still Texture Alpha)
+      // Connect Alpha (Source is still
+      // Texture Alpha)
       if (BlendMode == BLEND_Masked) {
         MatPtr->GetEditorOnlyData()->OpacityMask.Expression = BT;
         MatPtr->GetEditorOnlyData()->OpacityMask.OutputIndex = 4; // Alpha
@@ -1712,14 +2116,28 @@ void URoseImporter::EnsureMasterMaterial() {
 
       MatPtr->BlendMode = BlendMode;
       MatPtr->bUsedWithInstancedStaticMeshes = true;
-      MatPtr->TwoSided =
-          (BlendMode !=
-           BLEND_Opaque); // Default TwoSided for non-opaque? Or maybe not.
-                          // Let's keep existing logic (MIC overrides it).
+      MatPtr->TwoSided = true; // Always two-sided: some
+                               // ROSE meshes have
+                               // inconsistent face
+                               // normals
 
       MatPtr->PostEditChange();
       FAssetRegistryModule::AssetCreated(MatPtr);
       SaveRoseAsset(MatPtr);
+    }
+
+    // [Shadow Fix] Always ensure
+    // TwoSided is enabled, even on
+    // existing materials
+    if (MatPtr && !MatPtr->TwoSided) {
+      MatPtr->TwoSided = true;
+      MatPtr->PostEditChange();
+      SaveRoseAsset(MatPtr);
+      UE_LOG(LogRoseImporter, Log,
+             TEXT("[Material] Forced "
+                  "TwoSided=true on "
+                  "existing material: %s"),
+             *Name);
     }
   };
 
@@ -1737,9 +2155,12 @@ UTexture2D *URoseImporter::LoadRoseTexture(const FString &RP) {
   }
 
   FString AB = FPaths::GetBaseFilename(RP);
-  FString PN = TEXT("/Game/Rose/Imported/Textures/") + AB;
+  FString PN = TEXT("/Game/Rose/Imported/"
+                    "Textures/") +
+               AB;
 
-  // Check if texture already loaded in UE
+  // Check if texture already loaded in
+  // UE
   UTexture2D *Existing =
       FindObject<UTexture2D>(nullptr, *(PN + TEXT(".") + AB));
   if (Existing) {
@@ -1748,21 +2169,46 @@ UTexture2D *URoseImporter::LoadRoseTexture(const FString &RP) {
   }
 
   FString AP = FPaths::Combine(RoseRootPath, RP);
-  if (!FPaths::FileExists(AP)) {
-    FString DXT1 = FPaths::ChangeExtension(AP, TEXT("dds"));
-    if (FPaths::FileExists(DXT1)) {
-      AP = DXT1;
-    } else {
-      UE_LOG(LogRoseImporter, Error, TEXT("Texture not found: %s"), *AP);
-      return nullptr;
+
+  // Search Paths for ZON Textures (often
+  // just filenames)
+  TArray<FString> SearchPrefixes = {TEXT(""), // Direct relative path
+                                    TEXT("3Ddata/TERRAIN/TEXTURES/"),
+                                    TEXT("3Ddata/JUNON/TEXTURES/"),
+                                    TEXT("3Ddata/LUNAR/TEXTURES/"),
+                                    TEXT("3Ddata/ELDEON/TEXTURES/"),
+                                    TEXT("3Ddata/ORO/TEXTURES/"),
+                                    TEXT("3Ddata/MAPS/PCT/")};
+
+  bool bFound = false;
+  for (const FString &Prefix : SearchPrefixes) {
+    FString TryPath = FPaths::Combine(RoseRootPath, Prefix, RP);
+
+    if (FPaths::FileExists(TryPath)) {
+      AP = TryPath;
+      bFound = true;
+      break;
+    }
+    // Try DDS extension
+    FString DXT = FPaths::ChangeExtension(TryPath, TEXT("dds"));
+    if (FPaths::FileExists(DXT)) {
+      AP = DXT;
+      bFound = true;
+      break;
     }
   }
 
   UE_LOG(LogRoseImporter, Log,
-         TEXT("Attempting to load texture: %s -> Resolved: %s"), *RP, *AP);
+         TEXT("Attempting to load "
+              "texture: %s -> Resolved: "
+              "%s (Found: %d)"),
+         *RP, *AP, bFound);
 
-  if (!FPaths::FileExists(AP)) {
-    UE_LOG(LogRoseImporter, Error, TEXT("Texture File NOT FOUND: %s"), *AP);
+  if (!bFound) {
+    UE_LOG(LogRoseImporter, Error,
+           TEXT("Texture File NOT "
+                "FOUND: %s"),
+           *RP);
     return nullptr;
   }
 
@@ -1770,13 +2216,17 @@ UTexture2D *URoseImporter::LoadRoseTexture(const FString &RP) {
   if (FFileHelper::LoadFileToArray(FD, *AP) && FD.Num() > 128) {
     int32 W = *(int32 *)&FD[16], H = *(int32 *)&FD[12], F = *(int32 *)&FD[84];
     UE_LOG(LogRoseImporter, Log,
-           TEXT("[Texture] File loaded: %d bytes, Format: 0x%08X, Size: %dx%d"),
+           TEXT("[Texture] File loaded: "
+                "%d bytes, Format: "
+                "0x%08X, Size: %dx%d"),
            FD.Num(), F, W, H);
 
     TArray<uint8> DecompressedData;
 
     if (F == 0x33545844) { // DXT3
-      UE_LOG(LogRoseImporter, Log, TEXT("[Texture] Decompressing DXT3"));
+      UE_LOG(LogRoseImporter, Log,
+             TEXT("[Texture] "
+                  "Decompressing DXT3"));
       DecompressedData.SetNumUninitialized(W * H * 4);
       for (int y = 0; y < H; y += 4)
         for (int x = 0; x < W; x += 4)
@@ -1784,16 +2234,30 @@ UTexture2D *URoseImporter::LoadRoseTexture(const FString &RP) {
                                   ((y / 4) * (W / 4) + (x / 4)) * 16,
                               DecompressedData.GetData() + (y * W + x) * 4, W);
     } else if (F == 0x31545844) { // DXT1
-      UE_LOG(LogRoseImporter, Log, TEXT("[Texture] Decompressing DXT1"));
+      UE_LOG(LogRoseImporter, Log,
+             TEXT("[Texture] "
+                  "Decompressing DXT1"));
       DecompressedData.SetNumUninitialized(W * H * 4);
       for (int y = 0; y < H; y += 4)
         for (int x = 0; x < W; x += 4)
           DecompressDXT1Block(FD.GetData() + 128 +
                                   ((y / 4) * (W / 4) + (x / 4)) * 8,
                               DecompressedData.GetData() + (y * W + x) * 4, W);
+    } else if (F == 0x35545844) { // DXT5
+      UE_LOG(LogRoseImporter, Log,
+             TEXT("[Texture] "
+                  "Decompressing DXT5"));
+      DecompressedData.SetNumUninitialized(W * H * 4);
+      for (int y = 0; y < H; y += 4)
+        for (int x = 0; x < W; x += 4)
+          DecompressDXT5Block(FD.GetData() + 128 +
+                                  ((y / 4) * (W / 4) + (x / 4)) * 16,
+                              DecompressedData.GetData() + (y * W + x) * 4, W);
     } else {
       UE_LOG(LogRoseImporter, Error,
-             TEXT("[Texture] Unsupported DDS format: 0x%08X"), F);
+             TEXT("[Texture] Unsupported "
+                  "DDS format: 0x%08X"),
+             F);
       return nullptr;
     }
 
@@ -1820,7 +2284,9 @@ UTexture2D *URoseImporter::LoadRoseTexture(const FString &RP) {
                              W, H, ERGBFormat::RGBA, 8)) {
       const TArray64<uint8> &PNGData = ImageWrapper->GetCompressed(100);
       if (FFileHelper::SaveArrayToFile(PNGData, *TempPNGPath)) {
-        UE_LOG(LogRoseImporter, Log, TEXT("[Texture] Saved temp PNG: %s"),
+        UE_LOG(LogRoseImporter, Log,
+               TEXT("[Texture] Saved "
+                    "temp PNG: %s"),
                *TempPNGPath);
 
         // Import via UTextureFactory
@@ -1829,7 +2295,8 @@ UTexture2D *URoseImporter::LoadRoseTexture(const FString &RP) {
 
         UAssetImportTask *ImportTask = NewObject<UAssetImportTask>();
         ImportTask->Filename = TempPNGPath;
-        ImportTask->DestinationPath = TEXT("/Game/Rose/Imported/Textures");
+        ImportTask->DestinationPath = TEXT("/Game/Rose/Imported/"
+                                           "Textures");
         ImportTask->DestinationName = AB;
         ImportTask->bSave = true;
         ImportTask->bAutomated = true;
@@ -1848,27 +2315,35 @@ UTexture2D *URoseImporter::LoadRoseTexture(const FString &RP) {
               Cast<UTexture2D>(ImportTask->GetObjects()[0]);
           if (ImportedTexture) {
             UE_LOG(LogRoseImporter, Log,
-                   TEXT("[Texture] Successfully imported via factory: %s"),
+                   TEXT("[Texture] "
+                        "Successfully "
+                        "imported via "
+                        "factory: %s"),
                    *AB);
             TextureCache.Add(RP, ImportedTexture);
             return ImportedTexture;
           }
         }
 
-        UE_LOG(LogRoseImporter, Error, TEXT("[Texture] Factory import failed"));
+        UE_LOG(LogRoseImporter, Error,
+               TEXT("[Texture] Factory "
+                    "import failed"));
       } else {
         UE_LOG(LogRoseImporter, Error,
-               TEXT("[Texture] Failed to save temp PNG"));
+               TEXT("[Texture] Failed "
+                    "to save temp PNG"));
       }
     } else {
       UE_LOG(LogRoseImporter, Error,
-             TEXT("[Texture] Failed to create PNG wrapper"));
+             TEXT("[Texture] Failed to "
+                  "create PNG wrapper"));
     }
   } else {
-    UE_LOG(
-        LogRoseImporter, Error,
-        TEXT("[Texture] Failed to load file or file too small: %s (%d bytes)"),
-        *AP, FD.Num());
+    UE_LOG(LogRoseImporter, Error,
+           TEXT("[Texture] Failed to "
+                "load file or file too "
+                "small: %s (%d bytes)"),
+           *AP, FD.Num());
   }
   return nullptr;
 }
@@ -1911,7 +2386,8 @@ void URoseImporter::DecompressDXT3Block(const uint8 *B, uint8 *D, int32 S) {
 }
 
 void URoseImporter::DecompressDXT1Block(const uint8 *B, uint8 *D, int32 S) {
-  // DXT1: 8 bytes per 4x4 block (no explicit alpha)
+  // DXT1: 8 bytes per 4x4 block (no
+  // explicit alpha)
   uint16 C0 = *(uint16 *)B, C1 = *(uint16 *)(B + 2);
   uint32 IT = *(uint32 *)(B + 4);
 
@@ -1959,6 +2435,79 @@ void URoseImporter::DecompressDXT1Block(const uint8 *B, uint8 *D, int32 S) {
   }
 }
 
+void URoseImporter::DecompressDXT5Block(const uint8 *B, uint8 *D, int32 S) {
+  // Alpha block (first 8 bytes)
+  uint8 A0 = B[0];
+  uint8 A1 = B[1];
+  uint64 AB = (*(uint64 *)B) >> 16; // 48-bit table
+  uint8 Alpha[8];
+
+  Alpha[0] = A0;
+  Alpha[1] = A1;
+
+  if (A0 > A1) {
+    for (int i = 0; i < 6; ++i)
+      Alpha[2 + i] = ((6 - i) * A0 + (1 + i) * A1) / 7;
+  } else {
+    for (int i = 0; i < 4; ++i)
+      Alpha[2 + i] = ((4 - i) * A0 + (1 + i) * A1) / 5;
+    Alpha[6] = 0;
+    Alpha[7] = 255;
+  }
+
+  // Color block (next 8 bytes) - Same as
+  // DXT1
+  const uint8 *CB = B + 8;
+  uint16 C0 = *(uint16 *)(CB);
+  uint16 C1 = *(uint16 *)(CB + 2);
+  uint32 LT = *(uint32 *)(CB + 4);
+
+  auto DecodeColor = [](uint16 C) {
+    uint8 R = (C >> 11) & 0x1F;
+    uint8 G = (C >> 5) & 0x3F;
+    uint8 B = C & 0x1F;
+    return FColor((R * 255 + 15) / 31, (G * 255 + 31) / 63, (B * 255 + 15) / 31,
+                  255);
+  };
+
+  FColor Colors[4];
+  Colors[0] = DecodeColor(C0);
+  Colors[1] = DecodeColor(C1);
+  Colors[2] = FColor((2 * Colors[0].R + Colors[1].R) / 3,
+                     (2 * Colors[0].G + Colors[1].G) / 3,
+                     (2 * Colors[0].B + Colors[1].B) / 3, 255);
+  Colors[3] = FColor((Colors[0].R + 2 * Colors[1].R) / 3,
+                     (Colors[0].G + 2 * Colors[1].G) / 3,
+                     (Colors[0].B + 2 * Colors[1].B) / 3, 255);
+
+  for (int y = 0; y < 4; ++y) {
+    for (int x = 0; x < 4; ++x) {
+      // Alpha index
+      // 3 bits per pixel, total 48 bits
+      // (16 pixels) AB holds the 48
+      // bits. Index calculation: Pixel
+      // index P = y*4 + x Bit offset = P
+      // * 3
+      int P = y * 4 + x;
+      int BitOffset = P * 3;
+      int AIdx = (AB >> BitOffset) & 0x7;
+      uint8 FinalAlpha = Alpha[AIdx];
+
+      // Color index (2 bits)
+      uint8 CI = (LT >> (P * 2)) & 0x3;
+      FColor FinalColor = Colors[CI];
+
+      // Write BGRA (UE specific order
+      // for PNG/Texture)
+      int32 di = (y * S + x) * 4;
+      D[di + 0] = FinalColor.B;
+      D[di + 1] = FinalColor.G;
+      D[di + 2] = FinalColor.R;
+      D[di + 3] = FinalAlpha;
+    }
+  }
+}
+
 bool URoseImporter::ExportMeshToFBX(UStaticMesh *Mesh, const FString &FBXPath) {
   if (!Mesh)
     return false;
@@ -1983,7 +2532,9 @@ bool URoseImporter::ExportMeshToFBX(UStaticMesh *Mesh, const FString &FBXPath) {
   UExporter *Exporter = UExporter::FindExporter(Mesh, TEXT("FBX"));
 
   if (!Exporter) {
-    UE_LOG(LogRoseImporter, Error, TEXT("Could not find FBX exporter"));
+    UE_LOG(LogRoseImporter, Error,
+           TEXT("Could not find FBX "
+                "exporter"));
     return false;
   }
 
@@ -1997,7 +2548,8 @@ UStaticMesh *URoseImporter::ImportFBXMesh(const FString &FBXPath,
   UFbxFactory *FbxFactory = NewObject<UFbxFactory>();
   FbxFactory->AddToRoot(); // Prevent GC
 
-  // Configure import options via ImportUI
+  // Configure import options via
+  // ImportUI
   if (!FbxFactory->ImportUI) {
     FbxFactory->ImportUI = NewObject<UFbxImportUI>();
   }
@@ -2050,10 +2602,13 @@ UStaticMesh *URoseImporter::ImportRoseMesh(const FString &MP,
                          FPaths::GetBaseFilename(M->TexturePath))
                    : TEXT("NoMat");
 
-  // Fix: Use consistent AssetName (BaseName + Suffix) for both check and
-  // creation
+  // Fix: Use consistent AssetName
+  // (BaseName + Suffix) for both check
+  // and creation
   FString AssetName = ObjectTools::SanitizeObjectName(BN) + TEXT("_") + MS;
-  FString PN = TEXT("/Game/Rose/Imported/Meshes/") + AssetName;
+  FString PN = TEXT("/Game/Rose/"
+                    "Imported/Meshes/") +
+               AssetName;
   FString MeshFullPath = PN + TEXT(".") + AssetName;
 
   if (UStaticMesh *E = FindObject<UStaticMesh>(nullptr, *MeshFullPath)) {
@@ -2067,7 +2622,9 @@ UStaticMesh *URoseImporter::ImportRoseMesh(const FString &MP,
   FRoseZMS ZMS;
   if (!ZMS.Load(FPaths::Combine(RF, CP))) {
     UE_LOG(LogRoseImporter, Error,
-           TEXT("Failed to load ZMS file: '%s' (Root='%s', Rel='%s')"),
+           TEXT("Failed to load ZMS "
+                "file: '%s' (Root='%s', "
+                "Rel='%s')"),
            *FPaths::Combine(RF, CP), *RF, *CP);
     return nullptr;
   }
@@ -2085,7 +2642,8 @@ UStaticMesh *URoseImporter::ImportRoseMesh(const FString &MP,
   auto VPos = FStaticMeshAttributes(MD).GetVertexPositions();
   auto VNorms = FStaticMeshAttributes(MD).GetVertexInstanceNormals();
 
-  // Detect active UV channels and variance
+  // Detect active UV channels and
+  // variance
   bool bHasUV1 = false, bHasUV2 = false, bHasUV3 = false, bHasUV4 = false;
   FVector2f MinUV1(FLT_MAX, FLT_MAX), MaxUV1(-FLT_MAX, -FLT_MAX);
   FVector2f MinUV2(FLT_MAX, FLT_MAX), MaxUV2(-FLT_MAX, -FLT_MAX);
@@ -2116,8 +2674,9 @@ UStaticMesh *URoseImporter::ImportRoseMesh(const FString &MP,
   if (ExtentUV1 < 0.001f && ExtentUV2 > 0.01f) {
     SrcCh0 = 2;
     UE_LOG(LogRoseImporter, Warning,
-           TEXT("[SmartUV] Swapping UV2→Ch0 for '%s' (UV1=%f, UV2=%f)"), *BN,
-           ExtentUV1, ExtentUV2);
+           TEXT("[SmartUV] Swapping UV2→Ch0 "
+                "for '%s' (UV1=%f, UV2=%f)"),
+           *BN, ExtentUV1, ExtentUV2);
   }
 
   int32 NumUVs = 1;
@@ -2164,7 +2723,8 @@ UStaticMesh *URoseImporter::ImportRoseMesh(const FString &MP,
     MD.CreateTriangle(PG, T);
   }
 
-  // Create mesh directly in its final package (no FBX round-trip)
+  // Create mesh directly in its final
+  // package (no FBX round-trip)
   UPackage *MeshPkg = CreatePackage(*PN);
   MeshPkg->FullyLoad();
 
@@ -2176,6 +2736,9 @@ UStaticMesh *URoseImporter::ImportRoseMesh(const FString &MP,
   SM.BuildSettings.bRecomputeNormals = false;
   SM.BuildSettings.bRecomputeTangents = true;
   SM.BuildSettings.bRemoveDegenerates = true;
+  SM.BuildSettings.bGenerateLightmapUVs = true;
+  SM.BuildSettings.SrcLightmapIndex = 0; // Source: texture UVs
+  SM.BuildSettings.DstLightmapIndex = 1; // Destination: lightmap channel
   TArray<const FMeshDescription *> MDPs;
   MDPs.Add(&MD);
   FinalMesh->BuildFromMeshDescriptions(MDPs);
@@ -2196,22 +2759,29 @@ void URoseImporter::UpdateMeshMaterial(UStaticMesh *Mesh,
   if (!Mesh || !M)
     return;
 
-  // Determine Material Name from TexturePath if possible
+  // Determine Material Name from
+  // TexturePath if possible
   FString MS = TEXT("NoMat");
   if (!M->TexturePath.IsEmpty()) {
     MS = ObjectTools::SanitizeObjectName(
         FPaths::GetBaseFilename(M->TexturePath));
   }
 
-  FString MPN = TEXT("/Game/Rose/Imported/Materials/M_") + MS;
-  // FIX: Full object path = PackagePath.ObjectName
-  // MIC is created with name MS inside package M_MS
+  FString MPN = TEXT("/Game/Rose/Imported/"
+                     "Materials/M_") +
+                MS;
+  // FIX: Full object path =
+  // PackagePath.ObjectName MIC is
+  // created with name MS inside package
+  // M_MS
   FString FullMPN = MPN + TEXT(".") + MS;
 
-  // Performance Optimization: Check Cache
+  // Performance Optimization: Check
+  // Cache
   if (ProcessedMaterialPaths.Contains(MPN)) {
-    // Already processed (updated & saved) this session.
-    // We just need to ensure the Mesh uses it.
+    // Already processed (updated &
+    // saved) this session. We just need
+    // to ensure the Mesh uses it.
 
     // Try to find it in memory first
     UMaterialInstanceConstant *MIC =
@@ -2222,8 +2792,18 @@ void URoseImporter::UpdateMeshMaterial(UStaticMesh *Mesh,
     }
 
     if (MIC) {
+      // [Shadow Fix] Force TwoSided on
+      // cached MICs
+      if (!MIC->BasePropertyOverrides.TwoSided) {
+        MIC->BasePropertyOverrides.bOverride_TwoSided = true;
+        MIC->BasePropertyOverrides.TwoSided = true;
+        MIC->PostEditChange();
+      }
+
       if (Mesh->GetStaticMaterials().Num() > 0) {
-        // Only assign if different (avoid dirtying mesh unnecessarily)
+        // Only assign if different
+        // (avoid dirtying mesh
+        // unnecessarily)
         if (Mesh->GetStaticMaterials()[0].MaterialInterface != MIC) {
           Mesh->GetStaticMaterials()[0].MaterialInterface = MIC;
           Mesh->PostEditChange();
@@ -2283,15 +2863,18 @@ void URoseImporter::UpdateMeshMaterial(UStaticMesh *Mesh,
         MIC->SetTextureParameterValueEditorOnly(
             FMaterialParameterInfo(TEXT("BaseTexture")), T);
       } else {
-        UE_LOG(LogRoseImporter, Error, TEXT("Failed to load texture '%s'"),
+        UE_LOG(LogRoseImporter, Error,
+               TEXT("Failed to load "
+                    "texture '%s'"),
                *M->TexturePath);
       }
     }
 
-    if (M->TwoSided) {
-      MIC->BasePropertyOverrides.bOverride_TwoSided = true;
-      MIC->BasePropertyOverrides.TwoSided = true;
-    }
+    // [Shadow Fix] Always enable
+    // TwoSided - ROSE meshes have
+    // inconsistent normals
+    MIC->BasePropertyOverrides.bOverride_TwoSided = true;
+    MIC->BasePropertyOverrides.TwoSided = true;
 
     if (M->Red > 0.01f || M->Green > 0.01f || M->Blue > 0.01f) {
       MIC->SetVectorParameterValueEditorOnly(
@@ -2347,7 +2930,8 @@ UTexture2D *URoseImporter::CreateTextureAssetDXT(UObject *Outer, FName Name,
 }
 
 // ============================================================================
-// ZONETYPEINFO and TileSet Support Functions
+// ZONETYPEINFO and TileSet Support
+// Functions
 // ============================================================================
 
 bool URoseImporter::LoadZoneTypeInfo(const FString &RoseDataPath) {
@@ -2355,34 +2939,41 @@ bool URoseImporter::LoadZoneTypeInfo(const FString &RoseDataPath) {
     return true; // Already loaded
   }
 
-  // Path: 3Ddata/TERRAIN/TILES/ZONETYPEINFO.STB
-  FString STBPath = FPaths::Combine(
-      RoseDataPath, TEXT("3Ddata/TERRAIN/TILES/ZONETYPEINFO.STB"));
+  // Path:
+  // 3Ddata/TERRAIN/TILES/ZONETYPEINFO.STB
+  FString STBPath = FPaths::Combine(RoseDataPath, TEXT("3Ddata/TERRAIN/TILES/"
+                                                       "ZONETYPEINFO.STB"));
 
   // Try alternate path formats
   if (!FPaths::FileExists(STBPath)) {
-    STBPath = FPaths::Combine(RoseDataPath,
-                              TEXT("3DData/TERRAIN/TILES/ZONETYPEINFO.STB"));
+    STBPath = FPaths::Combine(RoseDataPath, TEXT("3DData/TERRAIN/TILES/"
+                                                 "ZONETYPEINFO.STB"));
   }
   if (!FPaths::FileExists(STBPath)) {
-    STBPath = FPaths::Combine(RoseDataPath,
-                              TEXT("3ddata/terrain/tiles/zonetypeinfo.stb"));
+    STBPath = FPaths::Combine(RoseDataPath, TEXT("3ddata/terrain/tiles/"
+                                                 "zonetypeinfo.stb"));
   }
 
   if (!FPaths::FileExists(STBPath)) {
-    UE_LOG(LogRoseImporter, Warning, TEXT("ZONETYPEINFO.STB not found at: %s"),
+    UE_LOG(LogRoseImporter, Warning,
+           TEXT("ZONETYPEINFO.STB not "
+                "found at: %s"),
            *STBPath);
     return false;
   }
 
   if (ZoneTypeInfoSTB.Load(STBPath)) {
     bZoneTypeInfoLoaded = true;
-    UE_LOG(LogRoseImporter, Log, TEXT("Loaded ZONETYPEINFO.STB: %d zone types"),
+    UE_LOG(LogRoseImporter, Log,
+           TEXT("Loaded ZONETYPEINFO.STB: "
+                "%d zone types"),
            ZoneTypeInfoSTB.GetRowCount());
     return true;
   }
 
-  UE_LOG(LogRoseImporter, Error, TEXT("Failed to parse ZONETYPEINFO.STB: %s"),
+  UE_LOG(LogRoseImporter, Error,
+         TEXT("Failed to parse "
+              "ZONETYPEINFO.STB: %s"),
          *STBPath);
   return false;
 }
@@ -2390,21 +2981,27 @@ bool URoseImporter::LoadZoneTypeInfo(const FString &RoseDataPath) {
 FString URoseImporter::GetTileSetPath(int32 ZoneType) const {
   if (!bZoneTypeInfoLoaded) {
     UE_LOG(LogRoseImporter, Warning,
-           TEXT("ZONETYPEINFO not loaded, cannot get TileSet path"));
+           TEXT("ZONETYPEINFO not loaded, "
+                "cannot get TileSet path"));
     return FString();
   }
 
   if (ZoneType < 0 || ZoneType >= ZoneTypeInfoSTB.GetRowCount()) {
-    UE_LOG(LogRoseImporter, Warning, TEXT("Invalid ZoneType %d (max: %d)"),
+    UE_LOG(LogRoseImporter, Warning,
+           TEXT("Invalid ZoneType %d (max: "
+                "%d)"),
            ZoneType, ZoneTypeInfoSTB.GetRowCount() - 1);
     return FString();
   }
 
-  // Column 6 contains the TileSet filename (e.g., "GRASS.TSI")
+  // Column 6 contains the TileSet
+  // filename (e.g., "GRASS.TSI")
   FString TileSetFile = ZoneTypeInfoSTB.GetCell(ZoneType, 6);
 
   if (TileSetFile.IsEmpty()) {
-    UE_LOG(LogRoseImporter, Warning, TEXT("No TileSet defined for ZoneType %d"),
+    UE_LOG(LogRoseImporter, Warning,
+           TEXT("No TileSet defined for "
+                "ZoneType %d"),
            ZoneType);
     return FString();
   }
@@ -2425,7 +3022,9 @@ bool URoseImporter::LoadTileSetForZone(int32 ZoneType,
   if (!bZoneTypeInfoLoaded) {
     if (!LoadZoneTypeInfo(RoseRootPath)) {
       UE_LOG(LogRoseImporter, Warning,
-             TEXT("Cannot load TileSet - ZONETYPEINFO not available"));
+             TEXT("Cannot load TileSet "
+                  "- ZONETYPEINFO not "
+                  "available"));
       return false;
     }
   }
@@ -2436,26 +3035,208 @@ bool URoseImporter::LoadTileSetForZone(int32 ZoneType,
     return false;
   }
 
-  // TileSet files are actually STB format
+  // TileSet files are actually STB
+  // format
   FRoseSTB TileSetSTB;
   if (!TileSetSTB.Load(TileSetPath)) {
-    UE_LOG(LogRoseImporter, Error, TEXT("Failed to load TileSet STB: %s"),
+    UE_LOG(LogRoseImporter, Error,
+           TEXT("Failed to load TileSet "
+                "STB: %s"),
            *TileSetPath);
     return false;
   }
 
   // Parse TileSet from STB
   if (!OutTileSet.LoadFromSTB(TileSetSTB)) {
-    UE_LOG(LogRoseImporter, Error, TEXT("Failed to parse TileSet: %s"),
+    UE_LOG(LogRoseImporter, Error,
+           TEXT("Failed to parse "
+                "TileSet: %s"),
            *TileSetPath);
     return false;
   }
 
   UE_LOG(LogRoseImporter, Log,
-         TEXT("Loaded TileSet for ZoneType %d: %d brushes"), ZoneType,
-         OutTileSet.Brushes.Num());
+         TEXT("Loaded TileSet for "
+              "ZoneType %d: %d brushes"),
+         ZoneType, OutTileSet.Brushes.Num());
 
   return true;
+}
+
+bool URoseImporter::GetBrushUVOffset(int32 TileID, int32 &OutU,
+                                     int32 &OutV) const {
+  if (!bCurrentTileSetValid)
+    return false;
+
+  for (const FRoseTileBrush &Brush : CurrentTileSet.Brushes) {
+    int32 RelIndex = -1;
+
+    // Check 3 ranges
+    if (TileID >= Brush.TileNumber &&
+        TileID < Brush.TileNumber + Brush.TileCount) {
+      RelIndex = TileID - Brush.TileNumber;
+    } else if (TileID >= Brush.TileNumber0 &&
+               TileID < Brush.TileNumber0 + Brush.TileCount0) {
+      RelIndex = TileID - Brush.TileNumber0;
+    } else if (TileID >= Brush.TileNumberF &&
+               TileID < Brush.TileNumberF + Brush.TileCountF) {
+      RelIndex = TileID - Brush.TileNumberF;
+    }
+
+    if (RelIndex != -1) {
+      // Assuming 4x4 Atlas layout
+      // (Standard for ROSE Brushes)
+      // RelIndex 0..15 -> U=0..3, V=0..3
+      OutU = RelIndex % 4;
+      OutV = RelIndex / 4;
+      return true;
+    }
+  }
+  return false;
+}
+
+UTexture2D *URoseImporter::CreateTileMapDataTexture(const FRoseTIL &TIL,
+                                                    const FRoseZON &ZON,
+                                                    const FString &TileName) {
+  int32 Width = 16;
+  int32 Height = 16;
+
+  FString AssetName = TEXT("TileData_") + TileName;
+  FString PackageName = TEXT("/Game/Rose/Imported/"
+                             "TileData/") +
+                        AssetName;
+
+  // Try to load existing
+  UTexture2D *Tex = LoadObject<UTexture2D>(nullptr, *PackageName);
+  UPackage *Package = nullptr;
+
+  if (Tex) {
+    UE_LOG(LogRoseImporter, Log, TEXT("Update TileMapData: %s"), *TileName);
+    Package = Tex->GetPackage();
+  } else {
+    UE_LOG(LogRoseImporter, Log, TEXT("Create TileMapData: %s"), *TileName);
+
+    Tex = UTexture2D::CreateTransient(Width, Height, PF_R8G8B8A8);
+    if (!Tex)
+      return nullptr;
+
+    Package = CreatePackage(*PackageName);
+    Tex->Rename(*AssetName, Package);
+    Tex->ClearFlags(RF_Transient);
+    Tex->SetFlags(RF_Public | RF_Standalone);
+  }
+
+  // CRITICAL: Ensure settings allow CPU
+  // Access + Uncompressed
+  Tex->CompressionSettings = TC_VectorDisplacementmap; // R8G8B8A8
+  Tex->SRGB = 0;
+  Tex->Filter = TF_Nearest;
+
+  // Ensure PlatformData exists
+  if (!Tex->GetPlatformData()) {
+    Tex->SetPlatformData(new FTexturePlatformData());
+  }
+
+  // Ensure Mips exist and are correct
+  // size
+  if (Tex->GetPlatformData()->Mips.Num() == 0) {
+    Tex->GetPlatformData()->Mips.Add(new FTexture2DMipMap());
+  }
+
+  // Re-size if needed
+  if (Tex->GetPlatformData()->Mips[0].SizeX != Width ||
+      Tex->GetPlatformData()->Mips[0].SizeY != Height) {
+    Tex->GetPlatformData()->Mips[0].SizeX = Width;
+    Tex->GetPlatformData()->Mips[0].SizeY = Height;
+  }
+
+  // Lock and write
+  uint8 *MipData =
+      (uint8 *)Tex->GetPlatformData()->Mips[0].BulkData.Lock(LOCK_READ_WRITE);
+
+  if (!MipData) {
+    UE_LOG(LogRoseImporter, Error,
+           TEXT("Failed to lock TileMapData "
+                "texture for writing! %s"),
+           *TileName);
+    return nullptr;
+  }
+
+  int32 BrushFoundCount = 0;
+
+  for (int32 y = 0; y < Height; ++y) {
+    for (int32 x = 0; x < Width; ++x) {
+      int32 PatchIdx = y * Width + x;
+      int32 TileID =
+          (PatchIdx < TIL.Patches.Num()) ? TIL.Patches[PatchIdx].Tile : -1;
+
+      int32 U = 0, V = 0;
+      int32 Alpha = 255; // Default to
+                         // Full UV (255)
+
+      if (TileID >= 0) {
+        int32 DummyU, DummyV;
+        // Even if we find a brush, we
+        // suspect the textures are NOT
+        // atlases but individual files.
+        // So we keep Alpha = 255 (Full
+        // UVs) to show the full texture.
+        // We still calculate U/V in case
+        // we want to use them for other
+        // offsets later, but Alpha
+        // controls the zoom.
+        if (GetBrushUVOffset(TileID, DummyU, DummyV)) {
+          U = DummyU;
+          V = DummyV;
+          Alpha = 255; // FIX: Force Full
+                       // UVs. Previous was 0
+                       // (Atlas Mode).
+          BrushFoundCount++;
+        }
+      }
+
+      int32 PixelIdx = (y * Width + x) * 4;
+      MipData[PixelIdx + 0] = (uint8)(U * 64); // R = U Offset
+      MipData[PixelIdx + 1] = (uint8)(V * 64); // G = V Offset
+      MipData[PixelIdx + 2] = 0;               // B (Rotation? Future)
+      MipData[PixelIdx + 3] = (uint8)Alpha;    // A = Mode (0=Atlas,
+                                               // 255=Full)
+    }
+  }
+
+  Tex->GetPlatformData()->Mips[0].BulkData.Unlock();
+  Tex->UpdateResource();
+
+  // Notify Asset Registry
+  FAssetRegistryModule::AssetCreated(Tex);
+  Tex->MarkPackageDirty();
+
+  // FORCE SAVE to disk
+  FString PackageFileName = FPackageName::LongPackageNameToFilename(
+      PackageName, FPackageName::GetAssetPackageExtension());
+
+  FSavePackageArgs SaveArgs;
+  SaveArgs.TopLevelFlags = RF_Public | RF_Standalone;
+  SaveArgs.SaveFlags = SAVE_NoError;
+  SaveArgs.Error = GError;
+
+  if (!UPackage::SavePackage(Package, Tex, *PackageFileName, SaveArgs)) {
+    UE_LOG(LogRoseImporter, Error,
+           TEXT("Failed to SAVE "
+                "TileData asset: %s"),
+           *PackageFileName);
+  } else {
+    // UE_LOG(LogRoseImporter, Log,
+    // TEXT("Saved TileData asset: %s"),
+    // *PackageFileName);
+  }
+
+  UE_LOG(LogRoseImporter, Log,
+         TEXT("TileMapData %s created. "
+              "Brushes found: %d / 256"),
+         *TileName, BrushFoundCount);
+
+  return Tex;
 }
 
 const FRoseTileBrush *URoseImporter::FindBrushForTile(int32 TileID) const {
@@ -2463,9 +3244,12 @@ const FRoseTileBrush *URoseImporter::FindBrushForTile(int32 TileID) const {
     return nullptr;
   }
 
-  // Iterate brushes to find which one contains this TileID
-  // A TileID belongs to a brush if it is within [TileNumber, TileNumber +
-  // TileCount] Or one of the other ranges (TileNumber0, TileNumberF)
+  // Iterate brushes to find which one
+  // contains this TileID A TileID
+  // belongs to a brush if it is within
+  // [TileNumber, TileNumber + TileCount]
+  // Or one of the other ranges
+  // (TileNumber0, TileNumberF)
 
   for (const FRoseTileBrush &Brush : CurrentTileSet.Brushes) {
     if (TileID >= Brush.TileNumber &&
@@ -2496,20 +3280,27 @@ bool URoseImporter::LoadZSCsFromListZone(const FString &RoseDataPath,
   }
 
   if (!FPaths::FileExists(ListZonePath)) {
-    UE_LOG(LogRoseImporter, Warning, TEXT("LIST_ZONE.STB not found at: %s"),
+    UE_LOG(LogRoseImporter, Warning,
+           TEXT("LIST_ZONE.STB not "
+                "found at: %s"),
            *ListZonePath);
     return false;
   }
 
   FRoseSTB ListZoneSTB;
   if (!ListZoneSTB.Load(ListZonePath)) {
-    UE_LOG(LogRoseImporter, Error, TEXT("Failed to load LIST_ZONE.STB: %s"),
+    UE_LOG(LogRoseImporter, Error,
+           TEXT("Failed to load "
+                "LIST_ZONE.STB: %s"),
            *ListZonePath);
     return false;
   }
 
-  // Debug: Search for zone in specific columns
-  UE_LOG(LogRoseImporter, Log, TEXT("Scanning LIST_ZONE.STB for zone: %s..."),
+  // Debug: Search for zone in specific
+  // columns
+  UE_LOG(LogRoseImporter, Log,
+         TEXT("Scanning LIST_ZONE.STB "
+              "for zone: %s..."),
          *ZoneNames[0]);
 
   // DEBUG: Verify Header (Row 0)
@@ -2526,13 +3317,17 @@ bool URoseImporter::LoadZSCsFromListZone(const FString &RoseDataPath,
   int32 FoundRow = -1;
   FString MatchedZoneName;
 
-  // Dynamic Column Lookup: Find "ZON" column index
+  // Dynamic Column Lookup: Find "ZON"
+  // column index
   int32 ZonColumnIndex = 3; // Default fallback
   if (ListZoneSTB.GetRowCount() > 0) {
     for (int32 j = 0; j < ListZoneSTB.GetColumnCount(); ++j) {
       if (ListZoneSTB.GetCell(0, j).ToUpper() == TEXT("ZON")) {
         ZonColumnIndex = j;
-        UE_LOG(LogRoseImporter, Log, TEXT("Found 'ZON' column at index %d"), j);
+        UE_LOG(LogRoseImporter, Log,
+               TEXT("Found 'ZON' column "
+                    "at index %d"),
+               j);
         break;
       }
     }
@@ -2551,10 +3346,12 @@ bool URoseImporter::LoadZSCsFromListZone(const FString &RoseDataPath,
         return FString();
       };
 
-      // Column 1 is usually the Shouting/Zone ID (e.g. JDT01)
+      // Column 1 is usually the
+      // Shouting/Zone ID (e.g. JDT01)
       FString RowName1 = FPaths::GetBaseFilename(SafeGetCell(i, 1)).ToUpper();
 
-      // Column 2 is sometimes used? Check both.
+      // Column 2 is sometimes used?
+      // Check both.
       FString RowName2 = FPaths::GetBaseFilename(SafeGetCell(i, 2)).ToUpper();
 
       // Use dynamic ZON column index
@@ -2564,7 +3361,9 @@ bool URoseImporter::LoadZSCsFromListZone(const FString &RoseDataPath,
       if (RowName1 == SearchName || RowName2 == SearchName ||
           RowZonFile == SearchName) {
         UE_LOG(LogRoseImporter, Log,
-               TEXT("MATCH FOUND at Row %d: Col1='%s', Col2='%s', Col%d='%s' "
+               TEXT("MATCH FOUND at Row "
+                    "%d: Col1='%s', "
+                    "Col2='%s', Col%d='%s' "
                     "(Search='%s')"),
                i, *RowName1, *RowName2, ZonColumnIndex, *RowZonFile,
                *SearchName);
@@ -2582,17 +3381,20 @@ bool URoseImporter::LoadZSCsFromListZone(const FString &RoseDataPath,
     for (const auto &C : ZoneNames)
       JoinedCandidates += C + TEXT(", ");
     UE_LOG(LogRoseImporter, Warning,
-           TEXT("Zone candidates [%s] not found in LIST_ZONE.STB"),
+           TEXT("Zone candidates [%s] not "
+                "found in LIST_ZONE.STB"),
            *JoinedCandidates);
     return false;
   }
 
   // Read ZSC paths
-  // C# says Cells[mapID][12] for Decoration, [13] for Construction
+  // C# says Cells[mapID][12] for
+  // Decoration, [13] for Construction
   FString DecoZSCFile = ListZoneSTB.GetCell(FoundRow, 12);
   FString CnstZSCFile = ListZoneSTB.GetCell(FoundRow, 13);
 
-  // Clean paths if they contain "3DData/" prefix (case insensitive)
+  // Clean paths if they contain
+  // "3DData/" prefix (case insensitive)
   auto CleanPath = [](const FString &InPath) -> FString {
     FString Temp = InPath;
     Temp.ReplaceInline(TEXT("\\"), TEXT("/"));
@@ -2605,11 +3407,12 @@ bool URoseImporter::LoadZSCsFromListZone(const FString &RoseDataPath,
   DecoZSCFile = CleanPath(DecoZSCFile);
   CnstZSCFile = CleanPath(CnstZSCFile);
 
-  UE_LOG(
-      LogRoseImporter, Log,
-      TEXT("Zone '%s' found in LIST_ZONE (Row %d). RawDeco: %s, RawCnst: %s"),
-      *MatchedZoneName, FoundRow, *ListZoneSTB.GetCell(FoundRow, 12),
-      *ListZoneSTB.GetCell(FoundRow, 13));
+  UE_LOG(LogRoseImporter, Log,
+         TEXT("Zone '%s' found in "
+              "LIST_ZONE (Row %d). "
+              "RawDeco: %s, RawCnst: %s"),
+         *MatchedZoneName, FoundRow, *ListZoneSTB.GetCell(FoundRow, 12),
+         *ListZoneSTB.GetCell(FoundRow, 13));
 
   bool bSuccess = true;
 
@@ -2618,10 +3421,13 @@ bool URoseImporter::LoadZSCsFromListZone(const FString &RoseDataPath,
     FString Path = FPaths::Combine(RoseDataPath, TEXT("3Ddata"), DecoZSCFile);
     if (DecoZSC.Load(Path)) {
       UE_LOG(LogRoseImporter, Log,
-             TEXT("Loaded Decoration ZSC: %d meshes, %d materials"),
+             TEXT("Loaded Decoration ZSC: "
+                  "%d meshes, %d materials"),
              DecoZSC.Meshes.Num(), DecoZSC.Materials.Num());
     } else {
-      UE_LOG(LogRoseImporter, Warning, TEXT("Failed to load Deco ZSC: %s"),
+      UE_LOG(LogRoseImporter, Warning,
+             TEXT("Failed to load Deco "
+                  "ZSC: %s"),
              *Path);
       bSuccess = false;
     }
@@ -2632,20 +3438,25 @@ bool URoseImporter::LoadZSCsFromListZone(const FString &RoseDataPath,
     FString Path = FPaths::Combine(RoseDataPath, TEXT("3Ddata"), CnstZSCFile);
     if (CnstZSC.Load(Path)) {
       UE_LOG(LogRoseImporter, Log,
-             TEXT("Loaded Construction ZSC: %d meshes, %d materials"),
+             TEXT("Loaded Construction ZSC: "
+                  "%d meshes, %d materials"),
              CnstZSC.Meshes.Num(), CnstZSC.Materials.Num());
     } else {
-      UE_LOG(LogRoseImporter, Warning, TEXT("Failed to load Cnst ZSC: %s"),
+      UE_LOG(LogRoseImporter, Warning,
+             TEXT("Failed to load Cnst "
+                  "ZSC: %s"),
              *Path);
       bSuccess = false;
     }
   }
 
-  // Dynamic Scan for AnimZSC (likely Col 11 or 14)
+  // Dynamic Scan for AnimZSC (likely Col
+  // 11 or 14)
   FString AnimZSCFile;
 
-  // First pass: Look for specific "Special" or "Event" ZSCs as suggested by
-  // user
+  // First pass: Look for specific
+  // "Special" or "Event" ZSCs as
+  // suggested by user
   for (int32 col = 0; col < ListZoneSTB.GetColumnCount(); ++col) {
     if (col == 12 || col == 13)
       continue;
@@ -2653,14 +3464,17 @@ bool URoseImporter::LoadZSCsFromListZone(const FString &RoseDataPath,
 
     if (CellVal.Contains(TEXT("EVENT_OBJECT"), ESearchCase::IgnoreCase) ||
         CellVal.Contains(TEXT("DECO_SPECIAL"), ESearchCase::IgnoreCase)) {
-      UE_LOG(LogRoseImporter, Log, TEXT("Found PRIORITY AnimZSC at Col %d: %s"),
+      UE_LOG(LogRoseImporter, Log,
+             TEXT("Found PRIORITY AnimZSC "
+                  "at Col %d: %s"),
              col, *CellVal);
       AnimZSCFile = CellVal;
       break;
     }
   }
 
-  // Second pass: If not found, take ANY extra ZSC
+  // Second pass: If not found, take ANY
+  // extra ZSC
   if (AnimZSCFile.IsEmpty()) {
     for (int32 col = 0; col < ListZoneSTB.GetColumnCount(); ++col) {
       if (col == 12 || col == 13)
@@ -2669,7 +3483,9 @@ bool URoseImporter::LoadZSCsFromListZone(const FString &RoseDataPath,
       if (CellVal.EndsWith(TEXT(".ZSC"), ESearchCase::IgnoreCase) ||
           CellVal.EndsWith(TEXT(".zsc"), ESearchCase::IgnoreCase)) {
         UE_LOG(LogRoseImporter, Log,
-               TEXT("Found generic AnimZSC at Col %d: %s"), col, *CellVal);
+               TEXT("Found generic AnimZSC "
+                    "at Col %d: %s"),
+               col, *CellVal);
         AnimZSCFile = CellVal;
         break;
       }
@@ -2681,18 +3497,24 @@ bool URoseImporter::LoadZSCsFromListZone(const FString &RoseDataPath,
         FPaths::Combine(RoseDataPath, TEXT("3Ddata"), AnimZSCFile);
     if (AnimZSC.Load(AnimZSCPath)) {
       UE_LOG(LogRoseImporter, Log,
-             TEXT("Loaded Animation ZSC: %d meshes, %d materials"),
+             TEXT("Loaded Animation ZSC: %d "
+                  "meshes, %d materials"),
              AnimZSC.Meshes.Num(), AnimZSC.Materials.Num());
     } else {
-      UE_LOG(LogRoseImporter, Warning, TEXT("Failed to load Anim ZSC: %s"),
+      UE_LOG(LogRoseImporter, Warning,
+             TEXT("Failed to load Anim "
+                  "ZSC: %s"),
              *AnimZSCPath);
-      // Don't fail the whole import for this, just warn
+      // Don't fail the whole import for
+      // this, just warn
     }
   } else {
-    UE_LOG(LogRoseImporter, Log, TEXT("No extra ZSC found for Animations."));
+    UE_LOG(LogRoseImporter, Log,
+           TEXT("No extra ZSC found for "
+                "Animations."));
   }
-}
-return bSuccess;
+
+  return bSuccess;
 }
 
 bool URoseImporter::SaveRoseAsset(UObject *Asset) {
@@ -2711,7 +3533,9 @@ bool URoseImporter::SaveRoseAsset(UObject *Asset) {
       Pkg->GetName(), FPackageName::GetAssetPackageExtension());
 
   // DEBUG: Log where we're saving
-  UE_LOG(LogRoseImporter, Warning, TEXT("[SaveAsset] Package: %s -> File: %s"),
+  UE_LOG(LogRoseImporter, Warning,
+         TEXT("[SaveAsset] Package: %s "
+              "-> File: %s"),
          *Pkg->GetName(), *PackageFileName);
 
   FSavePackageArgs SaveArgs;
@@ -2722,14 +3546,17 @@ bool URoseImporter::SaveRoseAsset(UObject *Asset) {
   if (UPackage::SavePackage(Pkg, Asset, *PackageFileName, SaveArgs)) {
     UE_LOG(LogRoseImporter, Verbose, TEXT("Saved asset: %s"), *PackageFileName);
 
-    // Force Asset Registry to scan the file we just saved
+    // Force Asset Registry to scan the
+    // file we just saved
     FAssetRegistryModule &AssetRegistryModule =
         FModuleManager::LoadModuleChecked<FAssetRegistryModule>(
             "AssetRegistry");
     AssetRegistryModule.Get().ScanFilesSynchronous(
         TArray<FString>{PackageFileName}, true);
 
-    UE_LOG(LogRoseImporter, Warning, TEXT("[SaveAsset] File scanned: %s"),
+    UE_LOG(LogRoseImporter, Warning,
+           TEXT("[SaveAsset] File "
+                "scanned: %s"),
            *PackageFileName);
 
     return true;
