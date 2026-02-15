@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
   "Version": 1,
-  "VersionName": "1.1",
+  "VersionName": "1.2",
   "FriendlyName": "BonsoirUnreal",
-  "Description": "ROSE Online Zone Importer (Release 1.1 - Animation Fixes, Flags Support, Collision Updates)",
+  "Description": "ROSE Online Zone Importer (Release 1.2 - Terrain Blending & Texture Fixes)",
   "Category": "Importers",
   "CreatedBy": "BarbieSpaghetti",
   "CreatedByURL": "",

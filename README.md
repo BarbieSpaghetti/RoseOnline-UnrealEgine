@@ -4,21 +4,6 @@ Import **ROSE Online** game assets (maps, terrain, objects, textures) directly i
 
 ---
 
-## 🆕 Release 1.1 Changelog (February 2026)
-
-### Added
-- **IFO Animation Support**: Now parses Type 6 blocks (`Animation`) from `.IFO` files.
-- **Dynamic ZSC Discovery**: Automatically finds special object lists (e.g., `EVENT_OBJECT.ZSC`, `LIST_DECO_SPECIAL.ZSC`) to correctly load flags and animated props.
-- **Animation Preview**: Animations now play automatically in the **Editor Viewport** (`bTickInEditor` enabled).
-
-### Fixed
-- **Animation System**: Fixed excessive deformation by limiting animation application to **Root Bone (ID 0)** only.
-- **Collision**: Disabled collision for `grass` objects to prevent player obstruction.
-- **Mesh Import**: Enabled **"Recompute Tangents"** to fix rendering artifacts (degenerate tangents).
-- **Zone Browser**: Improved column detection for `.ZON` files in the import dialog.
-
----
-
 ## Prerequisites
 
 | Requirement | Version |
@@ -121,14 +106,34 @@ To re-import a zone:
 
 ---
 
+## Changelog
+
+### Version 1.2 (Current)
+- **Terrain Blending:** Implemented Height Blending for smoother texture transitions using the alpha channel (e.g., paths over grass).
+- **Layer Limit:** Increased landscape layer limit from 24 to 64 per component to prevent missing textures on complex tiles.
+- **Texture Logic:** Fixed logic for secondary (overlay) textures to ensure they are correctly counted and assigned.
+- **Visual Improvements:** Adjusted default UV scale to 0.25 for more realistic texture density.
+- **Stability:** Fixed compilation errors and removed experimental rotation logic.
+
+### Version 1.1
+- **Animation Support:** Added support for animated objects (Type 6) and `.IFO` flags.
+- **Collision Fixes:** Automatically disabled collision for "grass" objects to prevent player obstruction.
+- **Usability:** Added drag-and-drop support for `.STB` zone lists.
+- **Tangent Fixes:** Enabled "Recompute Tangents" to fix rendering artifacts on some meshes.
+
+### Version 1.0
+- **Initial Release:** Complete import pipeline for `.ZON` files.
+- **Features:** Unified Landscape creation, HISM instancing for performance, automatic ZSC discovery, and material generation.
+
+---
+
 ## Credits
 
 - **Author:** BarbieSpaghetti
-- **Version:** 1.1
+- **Version:** 1.2
 - **Engine:** Unreal Engine 5.7
 - **License:** Private
 
 ---
 
 *Built with ❤️ for the ROSE Online community*
-
