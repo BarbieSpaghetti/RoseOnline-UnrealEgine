@@ -913,6 +913,7 @@ struct FRoseZMS {
   FVector3f Max;
 
   int32 BoneCount = 0;
+  TArray<int32> BoneIndices;
   int32 VertCount = 0;
 
   struct FVertex {
@@ -958,9 +959,12 @@ struct FRoseZMS {
     BoneCount = Count16;
 
     if (BoneCount > 0) {
-      UE_LOG(LogRoseImporter, Warning,
-             TEXT("ZMS has %d bones. Skipping (Not Implemented)."), BoneCount);
-      return false;
+      BoneIndices.SetNum(BoneCount);
+      for (int i = 0; i < BoneCount; ++i) {
+        uint16 b;
+        Ar << b;
+        BoneIndices[i] = b;
+      }
     }
 
     Ar << Count16;
@@ -1076,8 +1080,8 @@ struct FRoseZMS {
 struct FRoseBone {
   int32 ParentID;
   FString Name;
-  FVector Position;
-  FQuat Rotation;
+  FVector3f Position;
+  FQuat4f Rotation;
 };
 
 struct FRoseZMD {
@@ -1088,39 +1092,132 @@ struct FRoseZMD {
   bool Load(const FString &FilePath) {
     TArray<uint8> Data;
     if (!FFileHelper::LoadFileToArray(Data, *FilePath)) {
+      UE_LOG(LogRoseImporter, Error, TEXT("ZMD Load: Failed to read file %s"),
+             *FilePath);
       return false;
     }
     FMemoryReader R(Data, true);
     FRoseArchive Ar(R);
 
-    FormatString = Ar.ReadRoseString();
+    // ZMD Header is typically 7 bytes (ZMD000x)
+    // ReadRoseString reads until null, which might consume BoneCount if no
+    // delimiter exists.
+    char HeaderBuf[8] = {0}; // 7 chars + null
+    R.Serialize(HeaderBuf, 7);
+    FormatString = FString(ANSI_TO_TCHAR(HeaderBuf));
+
+    // Potentially skip some whitespace or nulls if present?
+    // Peek next byte?
+    // If next bytes are 00 00 00 00, it might be BoneCount=0 or padding.
+    // Let's assume standard fixed header.
+
+    UE_LOG(LogRoseImporter, Log, TEXT("ZMD Header: %s"), *FormatString);
+    UE_LOG(LogRoseImporter, Log, TEXT("File Pos after Header: %lld"), R.Tell());
+
+    // Skip potential null terminator if present
+    // Peek without advancing? FMemoryReader doesn't support Peek comfortably,
+    // but we can read and seek back.
+    uint8 NextByte = 0;
+    R << NextByte;
+    if (NextByte != 0) {
+      // If not null, rewind (it was part of BoneCount?)
+      // Wait, if BoneCount is uint32, and data is e.g. 05 00 00 00.
+      // If we read 05, it is not 0. we rewind.
+      // If data was 00 ... (BoneCount=0?), we consumed it.
+      // Safest: ZMD0003 is 7 chars. If 8th char is 0, consume it.
+      // Logic: Standard ROSE strings are null terminated.
+      R.Seek(R.Tell() - 1); // Rewind always
+      if (NextByte == 0) {
+        R.Seek(R.Tell() + 1); // Advance if it was 0
+      }
+    }
 
     uint32 BoneCount = 0;
     Ar << BoneCount;
 
+    UE_LOG(LogRoseImporter, Log, TEXT("ZMD BoneCount: %d"), BoneCount);
+
+    if (BoneCount > 1000) {
+      UE_LOG(LogRoseImporter, Error,
+             TEXT("ZMD BoneCount %d is too large (Limit 1000). Corrupt file or "
+                  "wrong format?"),
+             BoneCount);
+      return false;
+    }
+
     Bones.SetNum(BoneCount);
     for (uint32 i = 0; i < BoneCount; ++i) {
+      if (Ar.AtEnd()) {
+        UE_LOG(LogRoseImporter, Error,
+               TEXT("ZMD Unexpected EOF reading Bone %d"), i);
+        return false;
+      }
+
+      if (i == 0) {
+        int64 dPos = Ar.Tell();
+        uint8 dump[128];
+        int32 cnt = FMath::Min((int32)Ar.TotalSize() - (int32)dPos, 128);
+        Ar.Serialize(dump, cnt);
+        FString h;
+        for (int k = 0; k < cnt; k++)
+          h += FString::Printf(TEXT("%02X "), dump[k]);
+        UE_LOG(LogRoseImporter, Warning, TEXT("ZMD RAW (pos %lld): %s"), dPos,
+               *h);
+        Ar.Seek(dPos);
+      }
+
+      int64 bStart = Ar.Tell();
       Ar << Bones[i].ParentID;
+      int64 bParent = Ar.Tell();
       Bones[i].Name = Ar.ReadRoseString();
-      // ROSE Position is usually cm
+      int64 bName = Ar.Tell();
+
       Ar << Bones[i].Position.X << Bones[i].Position.Y << Bones[i].Position.Z;
-      // ROSE Quat is w, x, y, z
+      int64 bPos = Ar.Tell();
+
       float w, x, y, z;
       Ar << w << x << y << z;
-      Bones[i].Rotation = FQuat(x, y, z, w);
+      Bones[i].Rotation = FQuat4f(x, y, z, w);
+      int64 bRot = Ar.Tell();
+
+      // Read Scale (12 bytes) - FRoseBone does not have Scale, this was an
+      // error. Ar << Bones[i].Scale.X << Bones[i].Scale.Y << Bones[i].Scale.Z;
+      // int64 bScale = Ar.Tell();
+
+      if (i == 0) {
+        UE_LOG(LogRoseImporter, Warning,
+               TEXT("B0: Start=%lld, P=%lld, N=%lld, Pos=%lld, R=%lld"), bStart,
+               bParent, bName, bPos, bRot);
+        UE_LOG(LogRoseImporter, Warning,
+               TEXT("B0 DATA: Name='%s', Parent=%d, Pos=%s, Rot=%s"),
+               *Bones[i].Name, Bones[i].ParentID, *Bones[i].Position.ToString(),
+               *Bones[i].Rotation.ToString());
+      }
     }
 
     uint32 DummyCount = 0;
     Ar << DummyCount;
+
+    if (DummyCount > 1000) {
+      UE_LOG(LogRoseImporter, Warning,
+             TEXT("ZMD DummyCount %d is suspiciously large. Clamping to 0 to "
+                  "avoid crash."),
+             DummyCount);
+      DummyCount = 0;
+      // Not fatal, but skipping dummies
+    }
+
     Dummies.SetNum(DummyCount);
     for (uint32 i = 0; i < DummyCount; ++i) {
+      if (Ar.AtEnd())
+        break;
       Dummies[i].Name = Ar.ReadRoseString();
       Ar << Dummies[i].ParentID;
       Ar << Dummies[i].Position.X << Dummies[i].Position.Y
          << Dummies[i].Position.Z;
       float w, x, y, z;
       Ar << w << x << y << z;
-      Dummies[i].Rotation = FQuat(x, y, z, w);
+      Dummies[i].Rotation = FQuat4f(x, y, z, w);
     }
     return true;
   }
@@ -1136,9 +1233,9 @@ struct FRoseZMD {
 struct FRoseAnimChannel {
   int32 Type; // Bitfield: 2=Position, 4=Rotation, 1024=Scale
   int32 BoneID;
-  TArray<FVector> PosKeys;
-  TArray<FQuat> RotKeys;
-  TArray<FVector> ScaleKeys;
+  TArray<FVector3f> PosKeys;
+  TArray<FQuat4f> RotKeys;
+  TArray<FVector3f> ScaleKeys;
 };
 
 struct FRoseZMO {
@@ -1167,7 +1264,7 @@ struct FRoseZMO {
     for (int f = 0; f < FrameCount; ++f) {
       for (int i = 0; i < ChannelCount; ++i) {
         if (Channels[i].Type == 2) { // Position
-          FVector Pos;
+          FVector3f Pos;
           Ar << Pos.X << Pos.Y << Pos.Z;
           // Apply rtuPosition: (X, -Y, Z)
           Pos.Y = -Pos.Y;
@@ -1176,9 +1273,9 @@ struct FRoseZMO {
           float W, X, Y, Z;
           Ar << W << X << Y << Z;
           // Apply rtuRotation: (-X, Y, -Z, W)
-          Channels[i].RotKeys.Add(FQuat(-X, Y, -Z, W));
+          Channels[i].RotKeys.Add(FQuat4f(-X, Y, -Z, W));
         } else if (Channels[i].Type == 1024) { // Scale
-          FVector S;
+          FVector3f S;
           Ar << S.X << S.Y << S.Z;
           Channels[i].ScaleKeys.Add(S);
         } else {

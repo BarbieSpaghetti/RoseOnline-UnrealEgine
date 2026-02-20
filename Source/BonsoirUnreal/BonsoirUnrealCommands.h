@@ -4,7 +4,6 @@
 #include "CoreMinimal.h"
 #include "Framework/Commands/Commands.h"
 
-
 class FBonsoirUnrealCommands : public TCommands<FBonsoirUnrealCommands> {
 public:
   FBonsoirUnrealCommands()
@@ -18,4 +17,5 @@ public:
 
 public:
   TSharedPtr<FUICommandInfo> ImportZoneAction;
+  TSharedPtr<FUICommandInfo> ImportCharacterAction;
 };

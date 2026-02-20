@@ -15,6 +15,7 @@ public:
 private:
   void RegisterMenus();
   void OnImportZoneClicked();
+  void OnImportCharacterClicked();
 
 private:
   TSharedPtr<class FUICommandList> PluginCommands;

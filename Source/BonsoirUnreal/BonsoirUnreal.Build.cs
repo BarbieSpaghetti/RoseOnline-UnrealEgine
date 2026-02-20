@@ -6,11 +6,13 @@ public class BonsoirUnreal : ModuleRules
 	{
 		PCHUsage = PCHUsageMode.UseExplicitOrSharedPCHs;
 	
-		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "Landscape", "UnrealEd" });
+		PublicDependencyModuleNames.AddRange(new string[] { "Core", "CoreUObject", "Engine", "InputCore", "Landscape", "UnrealEd", "RenderCore", "AnimationCore" });
 
 		PrivateDependencyModuleNames.AddRange(new string[] { 
 			"MeshDescription", 
-			"StaticMeshDescription", 
+			"StaticMeshDescription",
+            "SkeletalMeshDescription", 
+			"MeshUtilities", 
 			"MeshUtilities", 
 			"MeshUtilitiesCommon",
 			"Slate",

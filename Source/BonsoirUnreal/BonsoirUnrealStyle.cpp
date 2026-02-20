@@ -4,7 +4,6 @@
 #include "Slate/SlateGameResources.h"
 #include "Styling/SlateStyleRegistry.h"
 
-
 TSharedPtr<FSlateStyleSet> FBonsoirUnrealStyle::StyleInstance = nullptr;
 
 void FBonsoirUnrealStyle::Initialize() {
@@ -47,6 +46,13 @@ TSharedRef<FSlateStyleSet> FBonsoirUnrealStyle::Create() {
   // Register icon - looking for icon in Content/Collections/Bonsoir.ico
   Style->Set(
       "BonsoirUnreal.ImportZoneAction",
+      new FSlateImageBrush(
+          Style->RootToContentDir(TEXT("Collections/Bonsoir"), TEXT(".png")),
+          FVector2D(40.0f, 40.0f)));
+
+  // Reusing same icon for Import Character to ensure visibility
+  Style->Set(
+      "BonsoirUnreal.ImportCharacterAction",
       new FSlateImageBrush(
           Style->RootToContentDir(TEXT("Collections/Bonsoir"), TEXT(".png")),
           FVector2D(40.0f, 40.0f)));

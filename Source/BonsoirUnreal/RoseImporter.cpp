@@ -1288,8 +1288,8 @@ void URoseImporter::CreateUnifiedLandscape(const TArray<FLoadedTile> &AllTiles,
       const FLoadedTile *Tile = TileMap.FindRef(FIntPoint(TileX, TileY));
 
       /* DISABLE MICs FOR DEBUGGING -
-      Validate Base Material First if
-      (Tile) {
+      Validate Base Material First
+      if (Tile) {
         // Generate TileMapData (Reuse
       existing function)
         // Use format Tile_X_Y
@@ -2116,6 +2116,7 @@ void URoseImporter::EnsureMasterMaterial() {
 
       MatPtr->BlendMode = BlendMode;
       MatPtr->bUsedWithInstancedStaticMeshes = true;
+      MatPtr->bUsedWithSkeletalMesh = true;
       MatPtr->TwoSided = true; // Always two-sided: some
                                // ROSE meshes have
                                // inconsistent face
@@ -2129,8 +2130,9 @@ void URoseImporter::EnsureMasterMaterial() {
     // [Shadow Fix] Always ensure
     // TwoSided is enabled, even on
     // existing materials
-    if (MatPtr && !MatPtr->TwoSided) {
+    if (MatPtr && (!MatPtr->TwoSided || !MatPtr->bUsedWithSkeletalMesh)) {
       MatPtr->TwoSided = true;
+      MatPtr->bUsedWithSkeletalMesh = true;
       MatPtr->PostEditChange();
       SaveRoseAsset(MatPtr);
       UE_LOG(LogRoseImporter, Log,
@@ -2168,40 +2170,72 @@ UTexture2D *URoseImporter::LoadRoseTexture(const FString &RP) {
     return Existing;
   }
 
-  FString AP = FPaths::Combine(RoseRootPath, RP);
-
-  // Search Paths for ZON Textures (often
-  // just filenames)
-  TArray<FString> SearchPrefixes = {TEXT(""), // Direct relative path
-                                    TEXT("3Ddata/TERRAIN/TEXTURES/"),
-                                    TEXT("3Ddata/JUNON/TEXTURES/"),
-                                    TEXT("3Ddata/LUNAR/TEXTURES/"),
-                                    TEXT("3Ddata/ELDEON/TEXTURES/"),
-                                    TEXT("3Ddata/ORO/TEXTURES/"),
-                                    TEXT("3Ddata/MAPS/PCT/")};
-
+  FString AP = RP;
   bool bFound = false;
-  for (const FString &Prefix : SearchPrefixes) {
-    FString TryPath = FPaths::Combine(RoseRootPath, Prefix, RP);
 
-    if (FPaths::FileExists(TryPath)) {
-      AP = TryPath;
+  // 1. Check if the path is absolute and exists
+  if (FPaths::FileExists(AP)) {
+    bFound = true;
+  }
+  // 2. Check Relative to RoseRootPath (if not already absolute)
+  else if (!FPaths::IsRelative(RP)) {
+    // If absolute but not found, try stripping root or searching by filename
+    // (This handles cases where the absolute path might be from a different
+    // machine/mount)
+    FString Filename = FPaths::GetCleanFilename(RP);
+    AP = FPaths::Combine(RoseRootPath, Filename);
+    if (FPaths::FileExists(AP)) {
       bFound = true;
-      break;
     }
-    // Try DDS extension
-    FString DXT = FPaths::ChangeExtension(TryPath, TEXT("dds"));
-    if (FPaths::FileExists(DXT)) {
-      AP = DXT;
+  } else {
+    AP = FPaths::Combine(RoseRootPath, RP);
+    if (FPaths::FileExists(AP)) {
       bFound = true;
-      break;
+    }
+  }
+
+  // 3. Search Paths for ZON Textures (often just filenames)
+  if (!bFound) {
+    TArray<FString> SearchPrefixes = {TEXT(""), // Direct relative path
+                                      TEXT("3Ddata/TERRAIN/TEXTURES/"),
+                                      TEXT("3Ddata/AVATAR/"),
+                                      TEXT("3Ddata/AVATAR/TEXTURES/"),
+                                      TEXT("3Ddata/JUNON/TEXTURES/"),
+                                      TEXT("3Ddata/LUNAR/TEXTURES/"),
+                                      TEXT("3Ddata/ELDEON/TEXTURES/"),
+                                      TEXT("3Ddata/ORO/TEXTURES/"),
+                                      TEXT("3Ddata/MAPS/PCT/")};
+
+    FString CleanRP = FPaths::GetCleanFilename(RP);
+    for (const FString &Prefix : SearchPrefixes) {
+      FString TryPath = FPaths::Combine(RoseRootPath, Prefix, RP);
+
+      if (FPaths::FileExists(TryPath)) {
+        AP = TryPath;
+        bFound = true;
+        break;
+      }
+
+      // Try with just filename + prefix
+      TryPath = FPaths::Combine(RoseRootPath, Prefix, CleanRP);
+      if (FPaths::FileExists(TryPath)) {
+        AP = TryPath;
+        bFound = true;
+        break;
+      }
+
+      // Try DDS extension
+      FString DXT = FPaths::ChangeExtension(TryPath, TEXT("dds"));
+      if (FPaths::FileExists(DXT)) {
+        AP = DXT;
+        bFound = true;
+        break;
+      }
     }
   }
 
   UE_LOG(LogRoseImporter, Log,
-         TEXT("Attempting to load "
-              "texture: %s -> Resolved: "
-              "%s (Found: %d)"),
+         TEXT("Attempting to load texture: %s -> Resolved: %s (Found: %d)"),
          *RP, *AP, bFound);
 
   if (!bFound) {
@@ -2253,6 +2287,55 @@ UTexture2D *URoseImporter::LoadRoseTexture(const FString &RP) {
           DecompressDXT5Block(FD.GetData() + 128 +
                                   ((y / 4) * (W / 4) + (x / 4)) * 16,
                               DecompressedData.GetData() + (y * W + x) * 4, W);
+    } else if (F == 0) {
+      // Possible Uncompressed RGB/RGBA
+      int32 BitCount = *(int32 *)&FD[88];
+      int32 PFlags = *(int32 *)&FD[80];
+
+      UE_LOG(LogRoseImporter, Log,
+             TEXT("[Texture] Format 0. BitCount: %d, Flags: 0x%X"), BitCount,
+             PFlags);
+
+      if (BitCount == 32) {
+        UE_LOG(LogRoseImporter, Log, TEXT("[Texture] Loading as BGRA 32-bit"));
+        int32 DataOffset = 128;
+        int32 TotalSize = W * H * 4;
+        if (FD.Num() >= DataOffset + TotalSize) {
+          DecompressedData.SetNumUninitialized(TotalSize);
+          FMemory::Memcpy(DecompressedData.GetData(), FD.GetData() + DataOffset,
+                          TotalSize);
+        } else {
+          // Fallback for truncated/weird files: copy what we have
+          UE_LOG(LogRoseImporter, Warning,
+                 TEXT("[Texture] File too small for 32-bit BGRA. Expected %d, "
+                      "Got %d"),
+                 TotalSize, FD.Num() - DataOffset);
+          DecompressedData = FD;
+          DecompressedData.RemoveAt(0, 128); // Strip header
+        }
+      } else if (BitCount == 24) {
+        UE_LOG(LogRoseImporter, Log, TEXT("[Texture] Loading as BGR 24-bit"));
+        int32 DataOffset = 128;
+        int32 TotalSize = W * H * 3;
+        if (FD.Num() >= DataOffset + TotalSize) {
+          DecompressedData.SetNumUninitialized(W * H * 4);
+          for (int32 p = 0; p < W * H; ++p) {
+            DecompressedData[p * 4 + 0] = FD[DataOffset + p * 3 + 0]; // B
+            DecompressedData[p * 4 + 1] = FD[DataOffset + p * 3 + 1]; // G
+            DecompressedData[p * 4 + 2] = FD[DataOffset + p * 3 + 2]; // R
+            DecompressedData[p * 4 + 3] = 255;                        // Alpha
+          }
+        } else {
+          UE_LOG(LogRoseImporter, Error,
+                 TEXT("[Texture] File too small for 24-bit BGR"));
+          return nullptr;
+        }
+      } else {
+        UE_LOG(LogRoseImporter, Error,
+               TEXT("[Texture] Unsupported uncompressed format BitCount: %d"),
+               BitCount);
+        return nullptr;
+      }
     } else {
       UE_LOG(LogRoseImporter, Error,
              TEXT("[Texture] Unsupported "

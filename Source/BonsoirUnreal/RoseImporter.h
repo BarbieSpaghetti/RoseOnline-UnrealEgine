@@ -21,9 +21,9 @@ public:
   float ElapsedTime = 0.0f;
 
   // Channel data
-  TArray<FVector> PosKeys;
-  TArray<FQuat> RotKeys;
-  TArray<FVector> ScaleKeys;
+  TArray<FVector3f> PosKeys;
+  TArray<FQuat4f> RotKeys;
+  TArray<FVector3f> ScaleKeys;
 
   // Target component to animate
   UPROPERTY()
@@ -63,24 +63,24 @@ public:
     if (PosKeys.Num() > 0) {
       Frame0 = FMath::Clamp(Frame0, 0, PosKeys.Num() - 1);
       Frame1 = FMath::Clamp(Frame1, 0, PosKeys.Num() - 1);
-      FVector Pos = FMath::Lerp(PosKeys[Frame0], PosKeys[Frame1], Alpha);
-      TargetComponent->SetRelativeLocation(Pos);
+      FVector3f Pos = FMath::Lerp(PosKeys[Frame0], PosKeys[Frame1], Alpha);
+      TargetComponent->SetRelativeLocation((FVector)Pos);
     }
 
     // Apply rotation
     if (RotKeys.Num() > 0) {
       Frame0 = FMath::Clamp(FMath::FloorToInt(FrameF), 0, RotKeys.Num() - 1);
       Frame1 = FMath::Clamp(Frame0 + 1, 0, RotKeys.Num() - 1);
-      FQuat Rot = FQuat::Slerp(RotKeys[Frame0], RotKeys[Frame1], Alpha);
-      TargetComponent->SetRelativeRotation(Rot.Rotator());
+      FQuat4f Rot = FQuat4f::Slerp(RotKeys[Frame0], RotKeys[Frame1], Alpha);
+      TargetComponent->SetRelativeRotation(((FQuat)Rot).Rotator());
     }
 
     // Apply scale
     if (ScaleKeys.Num() > 0) {
       Frame0 = FMath::Clamp(FMath::FloorToInt(FrameF), 0, ScaleKeys.Num() - 1);
       Frame1 = FMath::Clamp(Frame0 + 1, 0, ScaleKeys.Num() - 1);
-      FVector Scl = FMath::Lerp(ScaleKeys[Frame0], ScaleKeys[Frame1], Alpha);
-      TargetComponent->SetRelativeScale3D(Scl);
+      FVector3f Scl = FMath::Lerp(ScaleKeys[Frame0], ScaleKeys[Frame1], Alpha);
+      TargetComponent->SetRelativeScale3D((FVector)Scl);
     }
   }
 };
@@ -98,6 +98,9 @@ struct FLoadedTile {
 };
 
 class ALandscape;
+class USkeleton;
+class USkeletalMesh;
+class UAnimSequence;
 
 /**
  * ROSE Online Zone Importer
@@ -162,6 +165,10 @@ private:
   UPROPERTY()
   AActor *ZoneObjectsActor = nullptr;
 
+  // Bone world transforms in Unreal LHS space, populated by ImportSkeleton.
+  // Used for rigid face/hair binding (full transform: rotation + translation).
+  TMap<FName, FTransform> BoneWorldTransformsLHS;
+
   // Helper Functions
   bool LoadZoneTypeInfo(const FString &RootPath);
   FString GetTileSetPath(int32 ZoneType) const;
@@ -205,7 +212,6 @@ private:
   UMaterial *CreateLandscapeMaterial(const FRoseZON &ZON,
                                      const TArray<FLoadedTile> &AllTiles);
 
-  // Per-tile landscape layer helpers
   UMaterial *CreateTileMaterial(const FRoseTIL &TIL, const FRoseZON &ZON,
                                 const FString &TileName,
                                 TArray<int32> &OutTextureIDs);
@@ -213,6 +219,20 @@ private:
   TMap<int32, TArray<uint8>>
   GenerateTileWeightmaps(const FRoseTIL &TIL, const FRoseZON &ZON,
                          const TArray<int32> &TextureIDs);
+
+public:
+  // Character / Skeletal Mesh Import
+  USkeleton *ImportSkeleton(const FString &Path);
+  USkeletalMesh *ImportSkeletalMesh(const FString &Path, USkeleton *Skeleton);
+  USkeletalMesh *ImportUnifiedCharacter(const TArray<FString> &PartPaths,
+                                        USkeleton *Skeleton);
+  UAnimSequence *ImportAnimation(const FString &Path, USkeleton *Skeleton,
+                                 USkeletalMesh *Mesh);
+  void ImportDefaultCharacter(const FString &ZMDPath);
+
+private:
+  // Helper to find or load existing skeleton
+  USkeleton *FindOrLoadSkeleton(const FString &PackageName);
 
   void ProcessObjects(const FRoseIFO &IFO, UWorld *World,
                       const FVector &TileOffset, int32 MinX, int32 MinY,
@@ -237,6 +257,10 @@ private:
 
   // Texture Utils
 
-  // Fast in-memory texture cache (avoids redundant DDS loads)
+  // Fast in-memory texture cache (avoids
+  // redundant DDS loads)
   TMap<FString, UTexture2D *> TextureCache;
+
+  // Cache for ZMD->Skeleton index remapping
+  TArray<int32> CachedSkeletonRemap;
 };

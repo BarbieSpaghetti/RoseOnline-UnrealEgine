@@ -30,6 +30,12 @@ void FBonsoirUnrealModule::StartupModule() {
                                 &FBonsoirUnrealModule::OnImportZoneClicked),
       FCanExecuteAction());
 
+  PluginCommands->MapAction(
+      FBonsoirUnrealCommands::Get().ImportCharacterAction,
+      FExecuteAction::CreateRaw(
+          this, &FBonsoirUnrealModule::OnImportCharacterClicked),
+      FCanExecuteAction());
+
   // Register menus
   UToolMenus::RegisterStartupCallback(
       FSimpleMulticastDelegate::FDelegate::CreateRaw(
@@ -59,6 +65,11 @@ void FBonsoirUnrealModule::RegisterMenus() {
             Section.AddEntry(FToolMenuEntry::InitToolBarButton(
                 FBonsoirUnrealCommands::Get().ImportZoneAction));
         Entry.SetCommandList(PluginCommands);
+
+        FToolMenuEntry &CharEntry =
+            Section.AddEntry(FToolMenuEntry::InitToolBarButton(
+                FBonsoirUnrealCommands::Get().ImportCharacterAction));
+        CharEntry.SetCommandList(PluginCommands);
       }
     }
   }
@@ -143,6 +154,86 @@ void FBonsoirUnrealModule::OnImportZoneClicked() {
         }
       }
     }
+  }
+}
+
+void FBonsoirUnrealModule::OnImportCharacterClicked() {
+  // Use existing ROSE root discovery logic if possible, or prompt
+  // For now, let's assume we can find the ROSE folder from a previous import
+  // or prompt
+
+  // Simple: Just create the importer and run the default character logic
+  // The importer will need to find the files.
+
+  URoseImporter *Importer = NewObject<URoseImporter>();
+  if (Importer) {
+    Importer->AddToRoot();
+
+    // We need to tell the importer where the ROSE client is.
+    // Ideally prompts the user or uses a cached path.
+    // For this implementation, we will try to rely on hardcoded or relative
+    // paths in ImportDefaultCharacter OR we prompt for the ROSE Root folder?
+    // Let's prompt for the 3DDATA folder or a file in it to establish
+    // context.
+
+    IDesktopPlatform *DesktopPlatform = FDesktopPlatformModule::Get();
+    if (DesktopPlatform) {
+      TArray<FString> OutFiles;
+      const void *ParentWindowHandle =
+          FSlateApplication::Get().FindBestParentWindowHandleForDialogs(
+              nullptr);
+      // Prompt for ZON or similar to get root? Or just prompt for Directory?
+      // Let's prompt for the AVATAR/LIST_MALE.ZMD file to be specific.
+
+      if (DesktopPlatform->OpenFileDialog(
+              ParentWindowHandle,
+              TEXT("Select ROSE Avatar Skeleton (LIST_MALE.ZMD)"),
+              FPaths::ProjectContentDir(), TEXT("LIST_MALE.ZMD"),
+              TEXT("ROSE Skeleton (*.zmd)|*.zmd"), EFileDialogFlags::None,
+              OutFiles)) {
+        if (OutFiles.Num() > 0) {
+          // Found ZMD.
+          // We can derive Root from this?
+          // LIST_MALE.ZMD is in 3DDATA/AVATAR/
+          // So Root is ../../
+
+          // Actually, ImportDefaultCharacter logic can just take the ZMD path
+          // and assume standard layout? Let's update ImportDefaultCharacter
+          // to take the root path or ZMD path. But for now, calling it
+          // without args implies it knows. Let's change
+          // ImportDefaultCharacter to take a Path in the Header? No, let's
+          // just set the Context on Importer?
+
+          // Re-reading RoseImporter.h: ImportDefaultCharacter() takes no
+          // args. I should update RoseImporter_Char.cpp to use the file found
+          // here? Or better: Pass the path to ImportDefaultCharacter.
+
+          // IMPLEMENTATION DECISION:
+          // I will pass the ZMD path to ImportDefaultCharacter, but I need to
+          // update the header first. Wait, I can't update header easily right
+          // now without breaking 2 files. Check RoseImporter_Char.cpp
+          // again... it's just a void function.
+
+          // Temporary Hack: Global or Member variable? No.
+          // Let's just assume the user wants me to fix this properly.
+          // I will update RoseImporter.h to take a path.
+
+          Importer->ImportDefaultCharacter(OutFiles[0]);
+        }
+      }
+    }
+
+    // For now, let's just call it and rely on the log if it fails, or it has
+    // internal hardcoded path. RoseImporter_Char.cpp currently has: FString
+    // RoseRoot = TEXT("G:/Rose/For Release/New Version/C_S/Client/"); So it
+    // should work if the path matches the user's environment.
+
+    Importer->RemoveFromRoot();
+
+    FMessageDialog::Open(
+        EAppMsgType::Ok,
+        FText::FromString(
+            "Character Import Process Completed. Check Output Log."));
   }
 }
 
