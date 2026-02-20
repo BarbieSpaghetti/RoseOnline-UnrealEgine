@@ -1,6 +1,6 @@
 # 🌹 Bonsoir ROSE Importer — Unreal Engine Plugin
 
-Import **ROSE Online** game assets (maps, terrain, objects, textures) directly into Unreal Engine 5.7.
+Import **ROSE Online** game assets (maps, terrain, objects, textures, **characters**) directly into Unreal Engine 5.7.
 
 ---
 
@@ -18,9 +18,10 @@ The plugin reads the following file formats from the ROSE Online client:
 
 | Format | Description |
 |---|---|
-| `.ZON` | Zone definition (entry point for import) |
+| `.ZON` | Zone definition (entry point for map import) |
 | `.ZSC` | Zone Scene Container (object/building definitions, meshes, materials) |
 | `.ZMS` | Zone Mesh (3D mesh vertex/triangle data) |
+| `.ZMD` | Skeleton definition (bone hierarchy for characters) |
 | `.IFO` | Information File Object (object placement per tile) |
 | `.HIM` | Heightmap data |
 | `.TIL` | Tile texture assignments |
@@ -61,6 +62,15 @@ The plugin reads the following file formats from the ROSE Online client:
    - Import all decoration and building objects with correct transforms
    - Create and assign materials with textures from DDS files
 
+### Importing a Character
+
+Characters are imported automatically when the plugin processes character-related ZMS and ZMD files. The import pipeline:
+
+1. Loads the **ZMD skeleton** with correct RH→LH coordinate conversion
+2. Merges **body, face, and hair** mesh parts into a single `USkeletalMesh`
+3. Applies **rigid binding** for face/hair using the head bone's full world transform (rotation + translation)
+4. Loads **DDS textures** and creates material instances for each body part
+
 ### What Gets Imported
 
 | Asset Type | How It Appears in UE |
@@ -68,6 +78,7 @@ The plugin reads the following file formats from the ROSE Online client:
 | **Terrain** | `ALandscapeProxy` with blended texture layers |
 | **Decorations** | HISM (Hierarchical Instanced Static Mesh) components |
 | **Buildings** | HISM components |
+| **Characters** | `USkeletalMesh` with skeleton and materials |
 | **Textures** | `UTexture2D` assets in `/Game/Rose/Imported/Textures/` |
 | **Materials** | `UMaterialInstanceConstant` in `/Game/Rose/Imported/Materials/` |
 | **Meshes** | `UStaticMesh` in `/Game/Rose/Imported/Meshes/` |
@@ -79,6 +90,7 @@ All imported assets are organized under `/Game/Rose/`:
 Content/
 └── Rose/
     ├── Imported/
+    │   ├── Characters/    — Skeletal meshes and skeletons
     │   ├── Meshes/        — Static meshes from ZMS files
     │   ├── Materials/     — Material instances with textures
     │   └── Textures/      — DDS textures converted to UTexture2D
@@ -87,17 +99,18 @@ Content/
 
 ### Re-importing
 
-To re-import a zone:
-1. Delete the previously imported meshes in `/Game/Rose/Imported/Meshes/`
-2. Import the `.ZON` file again — existing landscape and objects will be replaced automatically
+To re-import assets:
+1. Delete the previously imported assets in `/Game/Rose/Imported/`
+2. Import the file again — existing assets will be replaced automatically
 
 ---
 
 ## Features
 
 - ✅ **Full zone import** — terrain + all objects in one step
+- ✅ **Character import** — skeleton + body/face/hair with correct positioning
 - ✅ **Automatic ZSC discovery** — finds decoration and building ZSCs via `LIST_ZONE.STB`
-- ✅ **Correct coordinate system** — handles ROSE→UE coordinate conversion (Y-flip, scale)
+- ✅ **Correct coordinate system** — handles ROSE→UE coordinate conversion (RH→LH, rtuPosition/rtuRotation)
 - ✅ **Multi-part objects** — supports objects with multiple mesh parts and correct transform composition
 - ✅ **Material handling** — opaque, alpha-blended, two-sided, and alpha-tested materials
 - ✅ **HISM instancing** — identical meshes share instances for optimal performance
@@ -108,7 +121,14 @@ To re-import a zone:
 
 ## Changelog
 
-### Version 1.2 (Current)
+### Version 1.3 (Current)
+- **Character Import:** Full character import pipeline with skeleton, body, face, and hair mesh parts merged into a single `USkeletalMesh`.
+- **Skeleton Conversion Fix:** Fixed critical bug where ZMD bone data was incorrectly treated as world transforms instead of local transforms. Now uses bones directly as local transforms (matching the ROSE format specification), with `rtuPosition(X, -Y, Z)` and `rtuRotation(-X, Y, -Z, W)` for RH→LH conversion.
+- **Rigid Binding:** Face and hair meshes are now correctly positioned and oriented on the character's head using the bone's full accumulated world transform (`TransformPosition`), applying both rotation and translation.
+- **Character Textures:** Added `EnsureMasterMaterial()` initialization in the unified character import path, fixing missing textures on character meshes.
+- **Bone World Transform Map:** Added `BoneWorldTransformsLHS` to store accumulated bone world transforms during skeleton import for accurate rigid mesh attachment.
+
+### Version 1.2
 - **Terrain Blending:** Implemented Height Blending for smoother texture transitions using the alpha channel (e.g., paths over grass).
 - **Layer Limit:** Increased landscape layer limit from 24 to 64 per component to prevent missing textures on complex tiles.
 - **Texture Logic:** Fixed logic for secondary (overlay) textures to ensure they are correctly counted and assigned.
@@ -130,7 +150,7 @@ To re-import a zone:
 ## Credits
 
 - **Author:** BarbieSpaghetti
-- **Version:** 1.2
+- **Version:** 1.3
 - **Engine:** Unreal Engine 5.7
 - **License:** Private
 

@@ -1,9 +1,9 @@
 {
   "FileVersion": 3,
   "Version": 1,
-  "VersionName": "1.2",
+  "VersionName": "1.3",
   "FriendlyName": "BonsoirUnreal",
-  "Description": "ROSE Online Zone Importer (Release 1.2 - Terrain Blending & Texture Fixes)",
+  "Description": "ROSE Online Importer — Zones, Characters, Skeletons & Textures (Release 1.3)",
   "Category": "Importers",
   "CreatedBy": "BarbieSpaghetti",
   "CreatedByURL": "",
